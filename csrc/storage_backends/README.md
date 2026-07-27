@@ -150,6 +150,21 @@ What `ConnectorBase` gives you for free:
 - eventfd signaling on completion (kernel wakes Python)
 - Graceful shutdown (stop flag, drain, join)
 
+#### Tiling: how batches are split across workers
+
+A batch of N keys is split into `choose_num_tiles(op, N)` tiles (default:
+`min(num_workers, N)`), each executed by one worker thread on its own
+connection. Tiles are **balanced**: every tile gets `floor(N / num_tiles)`
+keys and the first `N mod num_tiles` tiles get one extra, so no tile is ever
+empty and no degenerate 1-key remainder tiles are produced (13 keys over 5
+tiles → 3,3,3,2,2).
+
+Override `choose_num_tiles` to tune the fan-out per operation. The tradeoff
+only matters for backends with native multi-key commands: fewer tiles →
+fewer round trips; more tiles → more connection-level parallelism for
+payload transfer. `do_batch_*` overrides should still tolerate an empty
+`req.keys` defensively (return without sending anything).
+
 #### Optional: override `do_batch_*` for native multi-key commands
 
 By default each tile executes as a loop of `do_single_*` calls — one network
@@ -162,8 +177,13 @@ implementations:
   library's batch APIs (`batch_get_into`, `batchIsExist`, ...) and overrides
   `choose_num_tiles` to return 1 since the library parallelizes internally.
 - **Redis** (`redis/connector.cpp`): implements the batching at the RESP
-  protocol level, keeping the default tiling (one tile per worker
-  connection):
+  protocol level with a per-op tiling policy (`choose_num_tiles`): EXISTS
+  always uses 1 tile (the reply is a single integer — nothing to
+  parallelize), GET requires at least `mget_min_keys_per_tile` keys per tile
+  before fanning out to more connections (constructor arg, default 8;
+  exposed as `resp_mget_min_keys_per_tile` in non-MP `extra_config` and
+  `mget_min_keys_per_tile` in the MP `resp` L2 adapter config), and
+  SET/DELETE keep the default fan-out since they are still per-key commands:
   - `do_batch_get` issues one `MGET k1 .. kN` per tile. Misses (`$-1` nil
     replies) and size-mismatched values are tolerated per key: the unusable
     payload is drained so the connection stays in protocol sync, only that

@@ -784,6 +784,7 @@ class TestRESPL2AdapterConfig:
         assert config.num_workers == 8
         assert config.username == ""
         assert config.password == ""
+        assert config.mget_min_keys_per_tile == 8
 
     def test_from_dict_full(self):
         # First Party
@@ -799,6 +800,7 @@ class TestRESPL2AdapterConfig:
                 "num_workers": 16,
                 "username": "user",
                 "password": "pass",
+                "mget_min_keys_per_tile": 4,
             }
         )
         assert config.host == "10.0.0.1"
@@ -806,6 +808,23 @@ class TestRESPL2AdapterConfig:
         assert config.num_workers == 16
         assert config.username == "user"
         assert config.password == "pass"
+        assert config.mget_min_keys_per_tile == 4
+
+    def test_from_dict_invalid_mget_min_keys_per_tile_raises(self):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.resp_l2_adapter import (
+            RESPL2AdapterConfig,
+        )
+
+        with pytest.raises(ValueError, match="mget_min_keys_per_tile"):
+            RESPL2AdapterConfig.from_dict(
+                {
+                    "type": "resp",
+                    "host": "localhost",
+                    "port": 6379,
+                    "mget_min_keys_per_tile": 0,
+                }
+            )
 
     def test_from_dict_missing_host_raises(self):
         # First Party

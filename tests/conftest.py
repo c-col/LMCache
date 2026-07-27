@@ -311,12 +311,14 @@ class MockRESPClient:
         loop=None,
         username: str = "",
         password: str = "",
+        mget_min_keys_per_tile: int = 8,
     ):
         self._store: dict[str, bytes] = {}  # key -> bytes
         self._loop = loop
         self._closed = False
         self._username = username
         self._password = password
+        self._mget_min_keys_per_tile = mget_min_keys_per_tile
 
     async def exists(self, key: str) -> bool:
         return key in self._store

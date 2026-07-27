@@ -7,8 +7,9 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(lmcache_redis, m) {
   py::class_<lmcache::connector::RedisConnector>(m, "LMCacheRedisClient")
-      .def(py::init<std::string, int, int, std::string, std::string>(),
+      .def(py::init<std::string, int, int, std::string, std::string, size_t>(),
            py::arg("host"), py::arg("port"), py::arg("num_workers"),
-           py::arg("username") = "", py::arg("password") = "")
+           py::arg("username") = "", py::arg("password") = "",
+           py::arg("mget_min_keys_per_tile") = 8)
           LMCACHE_BIND_CONNECTOR_METHODS(lmcache::connector::RedisConnector);
 }

@@ -292,12 +292,17 @@ they tolerate misses and unexpected value sizes per key.
 */
 
 RedisConnector::RedisConnector(std::string host, int port, int num_workers,
-                               std::string username, std::string password)
+                               std::string username, std::string password,
+                               size_t mget_min_keys_per_tile)
     : ConnectorBase(num_workers),
       host_(std::move(host)),
       port_(port),
       username_(std::move(username)),
-      password_(std::move(password)) {
+      password_(std::move(password)),
+      mget_min_keys_per_tile_(mget_min_keys_per_tile) {
+  if (mget_min_keys_per_tile_ == 0) {
+    throw std::runtime_error("mget_min_keys_per_tile must be >= 1");
+  }
   worker_fds_.reserve(num_workers);
   start_workers();  // start after derived class is fully constructed
 }
@@ -454,6 +459,9 @@ or socket level failures throw (failing the whole tile).
 */
 void RedisConnector::do_batch_get(WorkerConn& conn, const Request& req) {
   const size_t num_keys = req.keys.size();
+  if (num_keys == 0) {
+    return;  // RESP has no zero-key MGET; nothing to do
+  }
 
   const std::string& cmd =
       conn.build_multikey_command(WorkerConn::mget_cmd_part, req.keys);
@@ -520,6 +528,9 @@ information, so we fall back to one pipelined round of single-key EXISTS.
 */
 void RedisConnector::do_batch_exists(WorkerConn& conn, const Request& req) {
   const size_t num_keys = req.keys.size();
+  if (num_keys == 0) {
+    return;  // RESP has no zero-key EXISTS; nothing to do
+  }
 
   const std::string& cmd =
       conn.build_multikey_command(WorkerConn::exists_cmd_part, req.keys);
@@ -577,6 +588,37 @@ void RedisConnector::resolve_partial_exists(WorkerConn& conn,
           "EXISTS pipeline returned invalid response that wasn't :0\r\n or "
           ":1\r\n");
     }
+  }
+}
+
+/*
+tiling policy for multi-key commands. the base default (one tile per worker)
+maximized parallelism when every key cost one round trip; with MGET and
+multi-key EXISTS, splitting small batches only fragments them into degenerate
+1-key commands.
+
+- EXISTS: the reply is a single integer regardless of key count, so there is
+  no payload transfer to parallelize — always use 1 tile (one command).
+- GET: keep fan-out for payload-heavy batches (parallel sockets overlap
+  transfer, and one giant MGET would hold single-threaded Redis longer), but
+  require at least mget_min_keys_per_tile_ keys per tile before adding more
+  connections.
+- SET / DELETE: still per-key commands, so fewer tiles would cut parallelism
+  with no round-trip savings — keep the base default.
+*/
+size_t RedisConnector::choose_num_tiles(Op op, size_t num_items) const {
+  const size_t max_tiles = std::min<size_t>(worker_count_for_op(op), num_items);
+
+  switch (op) {
+    case Op::BATCH_TILE_EXISTS:
+      return 1;
+    case Op::BATCH_TILE_GET: {
+      const size_t tiles_by_floor =
+          (num_items + mget_min_keys_per_tile_ - 1) / mget_min_keys_per_tile_;
+      return std::max<size_t>(1, std::min(max_tiles, tiles_by_floor));
+    }
+    default:
+      return max_tiles;
   }
 }
 

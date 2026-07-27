@@ -49,6 +49,7 @@ class RESPConnector(RemoteConnector):
         num_threads: int = 8,
         username: str = "",
         password: str = "",
+        mget_min_keys_per_tile: int = 8,
     ):
         # this gives us access to self.full_chunk_size_bytes
         super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
@@ -59,7 +60,15 @@ class RESPConnector(RemoteConnector):
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
 
-        self.client = RESPClient(host, port, num_threads, loop, username, password)
+        self.client = RESPClient(
+            host,
+            port,
+            num_threads,
+            loop,
+            username,
+            password,
+            mget_min_keys_per_tile,
+        )
         self.pq_executor = AsyncPQExecutor(loop)
 
     async def _exists(self, key: CacheEngineKey) -> bool:

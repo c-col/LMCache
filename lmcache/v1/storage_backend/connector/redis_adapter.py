@@ -43,6 +43,14 @@ class RESPConnectorAdapter(ConnectorAdapter):
         # Get number of threads for RESP connection pool (default is 8)
         self.resp_num_threads = int(extra_config.get("resp_num_threads", 8))
 
+        # Minimum keys per batched-GET tile before the batch is split across
+        # more worker connections (default is 8; must be >= 1)
+        self.resp_mget_min_keys_per_tile = int(
+            extra_config.get("resp_mget_min_keys_per_tile", 8)
+        )
+        if self.resp_mget_min_keys_per_tile < 1:
+            raise ValueError("resp_mget_min_keys_per_tile must be >= 1")
+
         # Config/CLI args take precedence over environment variables,
         # which serve as defaults. This keeps secrets out of logged
         # config while allowing explicit overrides.
@@ -70,6 +78,7 @@ class RESPConnectorAdapter(ConnectorAdapter):
             num_threads=self.resp_num_threads,
             username=username,
             password=password,
+            mget_min_keys_per_tile=self.resp_mget_min_keys_per_tile,
         )
 
 

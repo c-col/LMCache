@@ -45,6 +45,8 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
     - num_workers: C++ worker threads for I/O (default 8).
     - username: optional auth username.
     - password: optional auth password.
+    - mget_min_keys_per_tile: minimum keys per batched-GET tile before the
+      batch is split across more worker connections (default 8, >= 1).
     """
 
     def __init__(
@@ -55,6 +57,7 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
         username: str = "",
         password: str = "",
         max_capacity_gb: float = 0,
+        mget_min_keys_per_tile: int = 8,
     ):
         super().__init__()
         self.host = host
@@ -63,6 +66,7 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
         self.username = username
         self.password = password
         self.max_capacity_gb = max_capacity_gb
+        self.mget_min_keys_per_tile = mget_min_keys_per_tile
 
     @classmethod
     def from_dict(cls, d: dict) -> "RESPL2AdapterConfig":
@@ -85,6 +89,10 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
             raise ValueError("max_capacity_gb must be a non-negative number")
 
+        mget_min_keys_per_tile = d.get("mget_min_keys_per_tile", 8)
+        if not isinstance(mget_min_keys_per_tile, int) or mget_min_keys_per_tile < 1:
+            raise ValueError("mget_min_keys_per_tile must be a positive integer")
+
         return cls(
             host=host,
             port=port,
@@ -92,6 +100,7 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
             username=str(username),
             password=str(password),
             max_capacity_gb=float(max_capacity_gb),
+            mget_min_keys_per_tile=mget_min_keys_per_tile,
         )
 
     @classmethod
@@ -109,7 +118,11 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
             "(default empty)\n"
             "- max_capacity_gb (float): max L2 capacity "
             "in GB for usage tracking / eviction "
-            "(default 0 = disabled)\n\n"
+            "(default 0 = disabled)\n"
+            "- mget_min_keys_per_tile (int): minimum keys "
+            "per batched-GET tile before the batch is "
+            "split across more worker connections "
+            "(default 8, >=1)\n\n"
             "Environment variable defaults (used when "
             "config value is empty, read at adapter "
             "creation, not stored in config):\n"
@@ -159,12 +172,14 @@ def _create_resp_l2_adapter(
         config.num_workers,
         username,
         password,
+        config.mget_min_keys_per_tile,
     )
     logger.info(
-        "Created RESP L2 adapter: %s:%d (workers=%d)",
+        "Created RESP L2 adapter: %s:%d (workers=%d, mget_min_keys_per_tile=%d)",
         host,
         port,
         config.num_workers,
+        config.mget_min_keys_per_tile,
     )
     return NativeConnectorL2Adapter(
         native_client, max_capacity_gb=config.max_capacity_gb

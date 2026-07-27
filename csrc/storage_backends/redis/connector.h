@@ -106,8 +106,13 @@ struct WorkerConn {
 
 class RedisConnector : public ConnectorBase<WorkerConn> {
  public:
+  // mget_min_keys_per_tile: minimum keys a GET tile should carry before the
+  // batch is split across more worker connections (see choose_num_tiles).
+  // Must be >= 1. Higher values favor fewer, larger MGET commands; lower
+  // values favor connection-level parallelism for payload transfer.
   RedisConnector(std::string host, int port, int num_workers,
-                 std::string username = "", std::string password = "");
+                 std::string username = "", std::string password = "",
+                 size_t mget_min_keys_per_tile = 8);
   ~RedisConnector() override;
 
  protected:
@@ -124,6 +129,11 @@ class RedisConnector : public ConnectorBase<WorkerConn> {
   void do_batch_get(WorkerConn& conn, const Request& req) override;
   void do_batch_exists(WorkerConn& conn, const Request& req) override;
 
+  // tiling policy tuned for multi-key commands (see connector.cpp):
+  // EXISTS -> 1 tile, GET -> mget_min_keys_per_tile floor, SET/DELETE ->
+  // default fan-out (still per-key commands).
+  size_t choose_num_tiles(Op op, size_t num_items) const override;
+
   void shutdown_connections() override;
 
  private:
@@ -135,6 +145,7 @@ class RedisConnector : public ConnectorBase<WorkerConn> {
   int port_;
   std::string username_;
   std::string password_;
+  size_t mget_min_keys_per_tile_;
   std::mutex worker_fds_mu_;
   std::vector<int> worker_fds_;
 };

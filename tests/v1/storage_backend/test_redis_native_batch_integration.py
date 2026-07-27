@@ -85,11 +85,18 @@ class _SyncClient:
     matching completion arrives.
     """
 
-    def __init__(self, num_workers: int):
+    def __init__(self, num_workers: int, mget_min_keys_per_tile: int = 8):
         # First Party
         from lmcache.lmcache_redis import LMCacheRedisClient
 
-        self.client = LMCacheRedisClient(REDIS_HOST, REDIS_PORT, num_workers, "", "")
+        self.client = LMCacheRedisClient(
+            REDIS_HOST,
+            REDIS_PORT,
+            num_workers,
+            "",
+            "",
+            mget_min_keys_per_tile,
+        )
         self.poll = select.poll()
         self.poll.register(self.client.event_fd(), select.POLLIN)
         self.pending: dict[int, tuple[bool, str, list[bool]]] = {}
@@ -323,3 +330,165 @@ class TestBatchTiling:
                 assert bufs == payloads
         finally:
             client.batch_delete(keys)
+
+
+class TestTilingShapes:
+    """Regression tests for batch shapes whose ceil-based tiling used to
+    produce empty tiles (which emitted argument-less MGET/EXISTS commands and
+    failed the whole batch with -ERR) and degenerate 1-key remainder tiles.
+
+    ``mget_min_keys_per_tile=1`` forces maximum GET fan-out so the partition
+    logic itself is exercised rather than collapsed into a single tile.
+    """
+
+    # (num_keys, num_workers) shapes where ceil-splitting overshot:
+    # 9/8 -> 5 tiles of 2 + 3 EMPTY, 13/6 -> 3,3,3,3,1 + 1 EMPTY,
+    # 10/8 -> 5 tiles of 2 + 3 EMPTY, 17/16 -> 9 tiles of 2 + 7 EMPTY
+    SHAPES = [(9, 8), (13, 6), (10, 8), (17, 16)]
+
+    @pytest.mark.parametrize("num_keys,num_workers", SHAPES)
+    def test_no_empty_tiles(self, prefix, num_keys, num_workers):
+        client = _SyncClient(num_workers=num_workers, mget_min_keys_per_tile=1)
+        keys = [f"{prefix}:shape{i}" for i in range(num_keys)]
+        payloads = [_make_payload(i, CHUNK_SIZE) for i in range(num_keys)]
+
+        try:
+            ok, err, _ = client.batch_set(keys, payloads)
+            assert ok, err
+
+            ok, err, results = client.batch_exists(keys)
+            assert ok, err
+            assert results == [True] * num_keys
+
+            bufs = [bytearray(CHUNK_SIZE) for _ in keys]
+            ok, err, results = client.batch_get(keys, bufs)
+            assert ok, err
+            assert results == [True] * num_keys
+            assert bufs == payloads
+
+            ok, err, results = client.batch_delete(keys)
+            assert ok, err
+            assert results == [True] * num_keys
+        finally:
+            client.close()
+
+    @pytest.mark.parametrize("num_keys,num_workers", SHAPES)
+    def test_no_empty_tiles_when_partially_cached(self, prefix, num_keys, num_workers):
+        client = _SyncClient(num_workers=num_workers, mget_min_keys_per_tile=1)
+        keys = [f"{prefix}:pshape{i}" for i in range(num_keys)]
+        payloads = [_make_payload(i, CHUNK_SIZE) for i in range(num_keys)]
+
+        try:
+            ok, err, _ = client.batch_set(keys, payloads)
+            assert ok, err
+            ok, err, _ = client.batch_delete(keys[::2])
+            assert ok, err
+            expected = [i % 2 != 0 for i in range(num_keys)]
+
+            ok, err, results = client.batch_exists(keys)
+            assert ok, err
+            assert results == expected
+
+            bufs = [bytearray(CHUNK_SIZE) for _ in keys]
+            ok, err, results = client.batch_get(keys, bufs)
+            assert ok, err
+            assert results == expected
+        finally:
+            client.batch_delete(keys)
+            client.close()
+
+
+def _command_calls(command: str) -> int:
+    """Return the cumulative call count for a Redis command from commandstats.
+
+    Assumes a dedicated test server (as the rest of this module does); other
+    concurrent clients issuing the same command would skew the delta-based
+    assertions below.
+    """
+    out = subprocess.run(
+        ["redis-cli", "-h", REDIS_HOST, "-p", str(REDIS_PORT), "info", "commandstats"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    ).stdout
+    for line in out.splitlines():
+        if line.startswith(f"cmdstat_{command}:"):
+            return int(line.split("calls=")[1].split(",")[0])
+    return 0
+
+
+class TestTilingPolicy:
+    """Verify the command counts produced by RedisConnector::choose_num_tiles:
+    EXISTS collapses to one multi-key command, GET splits by the
+    mget_min_keys_per_tile floor."""
+
+    def test_exists_uses_one_command(self, prefix):
+        client = _SyncClient(num_workers=8)
+        keys = [f"{prefix}:pol{i}" for i in range(9)]
+        payloads = [_make_payload(i, CHUNK_SIZE) for i in range(9)]
+
+        try:
+            ok, err, _ = client.batch_set(keys, payloads)
+            assert ok, err
+
+            before = _command_calls("exists")
+            ok, err, results = client.batch_exists(keys)
+            assert ok, err
+            assert results == [True] * 9
+            # fully cached: one multi-key EXISTS, no pipelined fallback
+            assert _command_calls("exists") - before == 1
+        finally:
+            client.batch_delete(keys)
+            client.close()
+
+    def test_exists_partial_pipelines_per_key(self, prefix):
+        client = _SyncClient(num_workers=8)
+        keys = [f"{prefix}:polp{i}" for i in range(9)]
+        payloads = [_make_payload(i, CHUNK_SIZE) for i in range(9)]
+
+        try:
+            ok, err, _ = client.batch_set(keys, payloads)
+            assert ok, err
+            ok, err, _ = client.batch_delete(keys[:4])
+            assert ok, err
+
+            before = _command_calls("exists")
+            ok, err, results = client.batch_exists(keys)
+            assert ok, err
+            assert results == [False] * 4 + [True] * 5
+            # partial: 1 multi-key EXISTS + 9 pipelined single-key EXISTS
+            assert _command_calls("exists") - before == 10
+        finally:
+            client.batch_delete(keys)
+            client.close()
+
+    @pytest.mark.parametrize(
+        "num_keys,min_keys_per_tile,expected_mgets",
+        [
+            (8, 8, 1),  # exactly one floor's worth -> single MGET
+            (32, 8, 4),  # ceil(32/8) = 4 tiles
+            (32, 100, 1),  # floor larger than batch -> single MGET
+            (9, 1, 8),  # floor 1 -> one tile per worker (8 workers)
+        ],
+    )
+    def test_mget_respects_min_keys_per_tile(
+        self, prefix, num_keys, min_keys_per_tile, expected_mgets
+    ):
+        client = _SyncClient(num_workers=8, mget_min_keys_per_tile=min_keys_per_tile)
+        keys = [f"{prefix}:polm{i}" for i in range(num_keys)]
+        payloads = [_make_payload(i, CHUNK_SIZE) for i in range(num_keys)]
+
+        try:
+            ok, err, _ = client.batch_set(keys, payloads)
+            assert ok, err
+
+            bufs = [bytearray(CHUNK_SIZE) for _ in keys]
+            before = _command_calls("mget")
+            ok, err, results = client.batch_get(keys, bufs)
+            assert ok, err
+            assert results == [True] * num_keys
+            assert bufs == payloads
+            assert _command_calls("mget") - before == expected_mgets
+        finally:
+            client.batch_delete(keys)
+            client.close()
