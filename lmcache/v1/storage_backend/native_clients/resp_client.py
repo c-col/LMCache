@@ -25,7 +25,9 @@ class RESPClient(ConnectorClientBase[LMCacheRedisClient]):
         loop: Optional[asyncio.AbstractEventLoop] = None,
         username: str = "",
         password: str = "",
-        mget_min_keys_per_tile: int = 8,
+        get_min_keys_per_tile: int = 8,
+        get_batch_mode: str = "pipeline",
+        exists_batch_mode: str = "pipeline",
     ):
         """Create a RESP client backed by the native C++ Redis connector.
 
@@ -37,14 +39,27 @@ class RESPClient(ConnectorClientBase[LMCacheRedisClient]):
                 running loop).
             username: optional auth username.
             password: optional auth password.
-            mget_min_keys_per_tile: minimum keys a batched GET tile carries
+            get_min_keys_per_tile: minimum keys a batched GET tile carries
                 before the batch is split across more worker connections
-                (must be >= 1). Higher values favor fewer, larger MGET
-                commands; lower values favor connection-level parallelism.
+                (must be >= 1; applies to both get_batch_mode settings).
+                Higher values favor fewer, larger batched commands; lower
+                values favor connection-level parallelism.
+            get_batch_mode: how a batched-GET tile is executed. "pipeline"
+                (default) writes N single-key GET commands in one batch —
+                cluster-safe and fair to co-tenant clients. "mget" issues one
+                multi-key MGET per tile — single node/proxy only.
+            exists_batch_mode: how a batched-EXISTS tile is executed.
+                "pipeline" (default) writes N single-key EXISTS commands in
+                one batch — per-key results in one round trip, cluster-safe.
+                "multikey" issues one multi-key EXISTS per tile with a
+                pipelined per-key fallback for partial hits — single
+                node/proxy only.
 
         Raises:
-            RuntimeError: if the C++ Redis extension is not built, or if
-                mget_min_keys_per_tile is < 1.
+            RuntimeError: if the C++ Redis extension is not built, if
+                get_min_keys_per_tile is < 1, if get_batch_mode is not
+                "pipeline" or "mget", or if exists_batch_mode is not
+                "pipeline" or "multikey".
         """
         if not REDIS_AVAILABLE:
             raise RuntimeError(
@@ -57,6 +72,8 @@ class RESPClient(ConnectorClientBase[LMCacheRedisClient]):
             num_workers,
             username,
             password,
-            mget_min_keys_per_tile,
+            get_min_keys_per_tile,
+            get_batch_mode,
+            exists_batch_mode,
         )
         super().__init__(native_client, loop)

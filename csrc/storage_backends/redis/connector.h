@@ -104,15 +104,47 @@ struct WorkerConn {
       std::string_view cmd_part, const std::vector<std::string>& keys);
 };
 
+// how do_batch_get executes a tile of keys
+enum class GetBatchMode : uint8_t {
+  // N single-key GET commands written in one batch, then N replies read
+  // back. Same round-trip savings as MGET; each command executes and is
+  // routed independently, so cross-slot batches work on Redis Cluster and
+  // the server can interleave other clients between keys.
+  PIPELINE,
+  // one multi-key MGET command per tile. Slightly fewer reply bytes, but
+  // executes atomically (holds the event loop for the whole tile) and
+  // cross-slot batches fail on Redis Cluster.
+  MGET,
+};
+
+// how do_batch_exists executes a tile of keys
+enum class ExistsBatchMode : uint8_t {
+  // N single-key EXISTS commands written in one batch, then N :0/:1
+  // replies. Per-key results in one round trip, cluster-safe.
+  PIPELINE,
+  // one multi-key EXISTS per tile: its count reply resolves fully-cached /
+  // fully-uncached tiles in one tiny round trip, with a pipelined per-key
+  // fallback (one extra round trip) for partial counts. Cross-slot batches
+  // fail on Redis Cluster.
+  MULTIKEY,
+};
+
 class RedisConnector : public ConnectorBase<WorkerConn> {
  public:
-  // mget_min_keys_per_tile: minimum keys a GET tile should carry before the
-  // batch is split across more worker connections (see choose_num_tiles).
-  // Must be >= 1. Higher values favor fewer, larger MGET commands; lower
+  // get_min_keys_per_tile: minimum keys a batched-GET tile should carry
+  // before the batch is split across more worker connections (see
+  // choose_num_tiles). Must be >= 1. Applies to both get_batch_mode
+  // settings. Higher values favor fewer, larger batched commands; lower
   // values favor connection-level parallelism for payload transfer.
+  //
+  // get_batch_mode: "pipeline" (default) or "mget"; see GetBatchMode.
+  // exists_batch_mode: "pipeline" (default) or "multikey"; see
+  // ExistsBatchMode.
   RedisConnector(std::string host, int port, int num_workers,
                  std::string username = "", std::string password = "",
-                 size_t mget_min_keys_per_tile = 8);
+                 size_t get_min_keys_per_tile = 8,
+                 std::string get_batch_mode = "pipeline",
+                 std::string exists_batch_mode = "pipeline");
   ~RedisConnector() override;
 
  protected:
@@ -124,28 +156,47 @@ class RedisConnector : public ConnectorBase<WorkerConn> {
   bool do_single_exists(WorkerConn& conn, const std::string& key) override;
   bool do_single_delete(WorkerConn& conn, const std::string& key) override;
 
-  // batch overrides using Redis multi-key commands (one round trip per tile
-  // instead of one per key). See connector.cpp for the RESP wire details.
+  // batch overrides executing a whole tile in one round trip instead of one
+  // per key: GET via pipeline or MGET (get_batch_mode), SET via pipeline,
+  // EXISTS via pipeline or multi-key EXISTS (exists_batch_mode). See
+  // connector.cpp for the RESP wire details.
   void do_batch_get(WorkerConn& conn, const Request& req) override;
+  void do_batch_set(WorkerConn& conn, const Request& req) override;
   void do_batch_exists(WorkerConn& conn, const Request& req) override;
 
-  // tiling policy tuned for multi-key commands (see connector.cpp):
-  // EXISTS -> 1 tile, GET -> mget_min_keys_per_tile floor, SET/DELETE ->
-  // default fan-out (still per-key commands).
+  // tiling policy tuned for batched commands (see connector.cpp):
+  // EXISTS -> 1 tile, GET -> get_min_keys_per_tile floor, SET/DELETE ->
+  // default fan-out.
   size_t choose_num_tiles(Op op, size_t num_items) const override;
 
   void shutdown_connections() override;
 
  private:
-  // per-key resolution for a partially-cached EXISTS batch: one pipelined
-  // write of N single-key EXISTS commands followed by N integer replies
-  void resolve_partial_exists(WorkerConn& conn, const Request& req);
+  // the two do_batch_exists strategies (dispatched on exists_batch_mode_).
+  // the pipelined variant also serves as the multikey variant's per-key
+  // fallback for partially-cached tiles.
+  void do_batch_exists_pipelined(WorkerConn& conn, const Request& req);
+  void do_batch_exists_multikey(WorkerConn& conn, const Request& req);
+
+  // the two do_batch_get strategies (dispatched on get_batch_mode_)
+  void do_batch_get_pipelined(WorkerConn& conn, const Request& req);
+  void do_batch_get_mget(WorkerConn& conn, const Request& req);
+
+  // consume one bulk-string value reply for key i of req (the $<len> header
+  // line has already been read and parsed into value_len). Receives the
+  // payload into the destination buffer on an exact fit, otherwise drains
+  // it, and records the per-key result. Throws only on protocol/socket
+  // failures.
+  void consume_bulk_value(WorkerConn& conn, const Request& req, size_t i,
+                          int64_t value_len, const char* op_name);
 
   std::string host_;
   int port_;
   std::string username_;
   std::string password_;
-  size_t mget_min_keys_per_tile_;
+  size_t get_min_keys_per_tile_;
+  GetBatchMode get_batch_mode_;
+  ExistsBatchMode exists_batch_mode_;
   std::mutex worker_fds_mu_;
   std::vector<int> worker_fds_;
 };

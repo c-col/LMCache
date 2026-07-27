@@ -45,8 +45,14 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
     - num_workers: C++ worker threads for I/O (default 8).
     - username: optional auth username.
     - password: optional auth password.
-    - mget_min_keys_per_tile: minimum keys per batched-GET tile before the
-      batch is split across more worker connections (default 8, >= 1).
+    - get_min_keys_per_tile: minimum keys per batched-GET tile before the
+      batch is split across more worker connections (default 8, >= 1;
+      applies to both get_batch_mode settings).
+    - get_batch_mode: "pipeline" (default, cluster-safe) or "mget" (one
+      multi-key command per tile; single node/proxy only).
+    - exists_batch_mode: "pipeline" (default, cluster-safe) or "multikey"
+      (one multi-key EXISTS per tile with a pipelined per-key fallback for
+      partial hits; single node/proxy only).
     """
 
     def __init__(
@@ -57,7 +63,9 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
         username: str = "",
         password: str = "",
         max_capacity_gb: float = 0,
-        mget_min_keys_per_tile: int = 8,
+        get_min_keys_per_tile: int = 8,
+        get_batch_mode: str = "pipeline",
+        exists_batch_mode: str = "pipeline",
     ):
         super().__init__()
         self.host = host
@@ -66,7 +74,9 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
         self.username = username
         self.password = password
         self.max_capacity_gb = max_capacity_gb
-        self.mget_min_keys_per_tile = mget_min_keys_per_tile
+        self.get_min_keys_per_tile = get_min_keys_per_tile
+        self.get_batch_mode = get_batch_mode
+        self.exists_batch_mode = exists_batch_mode
 
     @classmethod
     def from_dict(cls, d: dict) -> "RESPL2AdapterConfig":
@@ -89,9 +99,23 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
             raise ValueError("max_capacity_gb must be a non-negative number")
 
-        mget_min_keys_per_tile = d.get("mget_min_keys_per_tile", 8)
-        if not isinstance(mget_min_keys_per_tile, int) or mget_min_keys_per_tile < 1:
-            raise ValueError("mget_min_keys_per_tile must be a positive integer")
+        # Fail loudly on the pre-rename key so it is not silently ignored
+        if "mget_min_keys_per_tile" in d:
+            raise ValueError(
+                "mget_min_keys_per_tile was renamed to get_min_keys_per_tile"
+            )
+
+        get_min_keys_per_tile = d.get("get_min_keys_per_tile", 8)
+        if not isinstance(get_min_keys_per_tile, int) or get_min_keys_per_tile < 1:
+            raise ValueError("get_min_keys_per_tile must be a positive integer")
+
+        get_batch_mode = d.get("get_batch_mode", "pipeline")
+        if get_batch_mode not in ("pipeline", "mget"):
+            raise ValueError("get_batch_mode must be 'pipeline' or 'mget'")
+
+        exists_batch_mode = d.get("exists_batch_mode", "pipeline")
+        if exists_batch_mode not in ("pipeline", "multikey"):
+            raise ValueError("exists_batch_mode must be 'pipeline' or 'multikey'")
 
         return cls(
             host=host,
@@ -100,7 +124,9 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
             username=str(username),
             password=str(password),
             max_capacity_gb=float(max_capacity_gb),
-            mget_min_keys_per_tile=mget_min_keys_per_tile,
+            get_min_keys_per_tile=get_min_keys_per_tile,
+            get_batch_mode=str(get_batch_mode),
+            exists_batch_mode=str(exists_batch_mode),
         )
 
     @classmethod
@@ -119,10 +145,19 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
             "- max_capacity_gb (float): max L2 capacity "
             "in GB for usage tracking / eviction "
             "(default 0 = disabled)\n"
-            "- mget_min_keys_per_tile (int): minimum keys "
+            "- get_min_keys_per_tile (int): minimum keys "
             "per batched-GET tile before the batch is "
             "split across more worker connections "
-            "(default 8, >=1)\n\n"
+            "(default 8, >=1)\n"
+            "- get_batch_mode (str): 'pipeline' (default, "
+            "cluster-safe pipelined GETs) or 'mget' (one "
+            "multi-key MGET per tile; single node/proxy "
+            "only)\n"
+            "- exists_batch_mode (str): 'pipeline' "
+            "(default, cluster-safe pipelined EXISTS) or "
+            "'multikey' (one multi-key EXISTS per tile "
+            "with pipelined per-key fallback; single "
+            "node/proxy only)\n\n"
             "Environment variable defaults (used when "
             "config value is empty, read at adapter "
             "creation, not stored in config):\n"
@@ -172,14 +207,19 @@ def _create_resp_l2_adapter(
         config.num_workers,
         username,
         password,
-        config.mget_min_keys_per_tile,
+        config.get_min_keys_per_tile,
+        config.get_batch_mode,
+        config.exists_batch_mode,
     )
     logger.info(
-        "Created RESP L2 adapter: %s:%d (workers=%d, mget_min_keys_per_tile=%d)",
+        "Created RESP L2 adapter: %s:%d (workers=%d, get_min_keys_per_tile=%d, "
+        "get_batch_mode=%s, exists_batch_mode=%s)",
         host,
         port,
         config.num_workers,
-        config.mget_min_keys_per_tile,
+        config.get_min_keys_per_tile,
+        config.get_batch_mode,
+        config.exists_batch_mode,
     )
     return NativeConnectorL2Adapter(
         native_client, max_capacity_gb=config.max_capacity_gb

@@ -43,13 +43,36 @@ class RESPConnectorAdapter(ConnectorAdapter):
         # Get number of threads for RESP connection pool (default is 8)
         self.resp_num_threads = int(extra_config.get("resp_num_threads", 8))
 
+        # Fail loudly on the pre-rename key so it is not silently ignored
+        if "resp_mget_min_keys_per_tile" in extra_config:
+            raise ValueError(
+                "resp_mget_min_keys_per_tile was renamed to resp_get_min_keys_per_tile"
+            )
+
         # Minimum keys per batched-GET tile before the batch is split across
         # more worker connections (default is 8; must be >= 1)
-        self.resp_mget_min_keys_per_tile = int(
-            extra_config.get("resp_mget_min_keys_per_tile", 8)
+        self.resp_get_min_keys_per_tile = int(
+            extra_config.get("resp_get_min_keys_per_tile", 8)
         )
-        if self.resp_mget_min_keys_per_tile < 1:
-            raise ValueError("resp_mget_min_keys_per_tile must be >= 1")
+        if self.resp_get_min_keys_per_tile < 1:
+            raise ValueError("resp_get_min_keys_per_tile must be >= 1")
+
+        # How a batched-GET tile is executed: "pipeline" (default,
+        # cluster-safe) or "mget" (one multi-key command per tile)
+        self.resp_get_batch_mode = str(
+            extra_config.get("resp_get_batch_mode", "pipeline")
+        )
+        if self.resp_get_batch_mode not in ("pipeline", "mget"):
+            raise ValueError("resp_get_batch_mode must be 'pipeline' or 'mget'")
+
+        # How a batched-EXISTS tile is executed: "pipeline" (default,
+        # cluster-safe) or "multikey" (one multi-key EXISTS per tile with a
+        # pipelined per-key fallback for partial hits)
+        self.resp_exists_batch_mode = str(
+            extra_config.get("resp_exists_batch_mode", "pipeline")
+        )
+        if self.resp_exists_batch_mode not in ("pipeline", "multikey"):
+            raise ValueError("resp_exists_batch_mode must be 'pipeline' or 'multikey'")
 
         # Config/CLI args take precedence over environment variables,
         # which serve as defaults. This keeps secrets out of logged
@@ -78,7 +101,9 @@ class RESPConnectorAdapter(ConnectorAdapter):
             num_threads=self.resp_num_threads,
             username=username,
             password=password,
-            mget_min_keys_per_tile=self.resp_mget_min_keys_per_tile,
+            get_min_keys_per_tile=self.resp_get_min_keys_per_tile,
+            get_batch_mode=self.resp_get_batch_mode,
+            exists_batch_mode=self.resp_exists_batch_mode,
         )
 
 

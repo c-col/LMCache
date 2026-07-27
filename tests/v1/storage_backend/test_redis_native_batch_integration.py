@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Integration tests for the batched Redis C++ connector (multi-key EXISTS and
-MGET).
+Integration tests for the batched Redis C++ connector.
 
 These tests exercise the native ``lmcache_redis`` extension's batch paths:
 
-- ``do_batch_exists``: one multi-key ``EXISTS k1 .. kN`` round trip when the
-  tile is fully cached or fully uncached, with a pipelined per-key fallback
-  for partially cached tiles.
-- ``do_batch_get``: one ``MGET k1 .. kN`` round trip per tile with per-key
-  miss tolerance (``$-1`` nil replies and size-mismatched values fail only
-  that key and keep the connection in protocol sync).
+- ``do_batch_exists``: one round trip per tile in either mode — ``pipeline``
+  (default: N single-key EXISTS commands written in one batch) or
+  ``multikey`` (one multi-key ``EXISTS k1 .. kN``, resolving fully cached /
+  fully uncached tiles from its count reply, with a pipelined per-key
+  fallback for partially cached tiles).
+- ``do_batch_get``: one round trip per tile in either mode — ``pipeline``
+  (default: N single-key GETs written in one batch) or ``mget`` (one
+  multi-key MGET) — with per-key miss tolerance (nil replies, per-key error
+  replies, and size-mismatched values fail only that key and keep the
+  connection in protocol sync).
+- ``do_batch_set``: one pipelined round trip per tile (N SET commands
+  written via scatter-gather, then N status replies).
 
 Requires a running Redis server and the C++ extension. Skipped otherwise.
 """
@@ -85,7 +90,13 @@ class _SyncClient:
     matching completion arrives.
     """
 
-    def __init__(self, num_workers: int, mget_min_keys_per_tile: int = 8):
+    def __init__(
+        self,
+        num_workers: int,
+        get_min_keys_per_tile: int = 8,
+        get_batch_mode: str = "pipeline",
+        exists_batch_mode: str = "pipeline",
+    ):
         # First Party
         from lmcache.lmcache_redis import LMCacheRedisClient
 
@@ -95,7 +106,9 @@ class _SyncClient:
             num_workers,
             "",
             "",
-            mget_min_keys_per_tile,
+            get_min_keys_per_tile,
+            get_batch_mode,
+            exists_batch_mode,
         )
         self.poll = select.poll()
         self.poll.register(self.client.event_fd(), select.POLLIN)
@@ -131,11 +144,23 @@ class _SyncClient:
         self.client.close()
 
 
-@pytest.fixture
-def client():
+# (get_batch_mode, exists_batch_mode) pairs covering both wire strategy
+# stacks: the cluster-safe pipelined default and the multi-key alternative
+MODE_PAIRS = [("pipeline", "pipeline"), ("mget", "multikey")]
+
+
+@pytest.fixture(params=MODE_PAIRS, ids=["pipeline", "multikey"])
+def client(request):
     """Single-worker client: every tile shares one connection, so any RESP
-    desync from a previous operation breaks the next one loudly."""
-    c = _SyncClient(num_workers=1)
+    desync from a previous operation breaks the next one loudly.
+
+    Parametrized over both batch-mode stacks so every test exercises both
+    wire strategies.
+    """
+    get_mode, exists_mode = request.param
+    c = _SyncClient(
+        num_workers=1, get_batch_mode=get_mode, exists_batch_mode=exists_mode
+    )
     yield c
     c.close()
 
@@ -256,6 +281,43 @@ class TestBatchGet:
 
         client.batch_delete([small_key])
 
+    def test_wrong_type_key_fails_per_key(self, client, stored_keys, prefix):
+        """A non-string key fails only itself: pipeline mode gets a per-key
+        WRONGTYPE error reply, mget mode gets a nil — both must keep the
+        connection in sync for the surrounding keys and later batches."""
+        keys, payloads = stored_keys
+        list_key = f"{prefix}:wrongtype"
+        subprocess.run(
+            [
+                "redis-cli",
+                "-h",
+                REDIS_HOST,
+                "-p",
+                str(REDIS_PORT),
+                "lpush",
+                list_key,
+                "x",
+            ],
+            capture_output=True,
+            timeout=5,
+            check=True,
+        )
+
+        try:
+            bufs = [bytearray(CHUNK_SIZE) for _ in range(3)]
+            ok, err, results = client.batch_get([keys[0], list_key, keys[1]], bufs)
+            assert ok, err
+            assert results == [True, False, True]
+            assert bufs[0] == payloads[0]
+            assert bufs[2] == payloads[1]
+
+            # connection must still be usable after the error reply
+            ok, err, results = client.batch_exists(keys)
+            assert ok, err
+            assert results == [True] * len(keys)
+        finally:
+            client.batch_delete([list_key])
+
 
 class TestBatchTiling:
     """Batches larger than the worker count are split into per-worker tiles;
@@ -264,9 +326,12 @@ class TestBatchTiling:
     NUM_KEYS = 200
     BIG_CHUNK = 16384
 
-    @pytest.fixture
-    def multi_worker_client(self):
-        c = _SyncClient(num_workers=8)
+    @pytest.fixture(params=MODE_PAIRS, ids=["pipeline", "multikey"])
+    def multi_worker_client(self, request):
+        get_mode, exists_mode = request.param
+        c = _SyncClient(
+            num_workers=8, get_batch_mode=get_mode, exists_batch_mode=exists_mode
+        )
         yield c
         c.close()
 
@@ -337,7 +402,7 @@ class TestTilingShapes:
     produce empty tiles (which emitted argument-less MGET/EXISTS commands and
     failed the whole batch with -ERR) and degenerate 1-key remainder tiles.
 
-    ``mget_min_keys_per_tile=1`` forces maximum GET fan-out so the partition
+    ``get_min_keys_per_tile=1`` forces maximum GET fan-out so the partition
     logic itself is exercised rather than collapsed into a single tile.
     """
 
@@ -346,9 +411,19 @@ class TestTilingShapes:
     # 10/8 -> 5 tiles of 2 + 3 EMPTY, 17/16 -> 9 tiles of 2 + 7 EMPTY
     SHAPES = [(9, 8), (13, 6), (10, 8), (17, 16)]
 
+    @pytest.mark.parametrize(
+        "get_batch_mode,exists_batch_mode", MODE_PAIRS, ids=["pipeline", "multikey"]
+    )
     @pytest.mark.parametrize("num_keys,num_workers", SHAPES)
-    def test_no_empty_tiles(self, prefix, num_keys, num_workers):
-        client = _SyncClient(num_workers=num_workers, mget_min_keys_per_tile=1)
+    def test_no_empty_tiles(
+        self, prefix, num_keys, num_workers, get_batch_mode, exists_batch_mode
+    ):
+        client = _SyncClient(
+            num_workers=num_workers,
+            get_min_keys_per_tile=1,
+            get_batch_mode=get_batch_mode,
+            exists_batch_mode=exists_batch_mode,
+        )
         keys = [f"{prefix}:shape{i}" for i in range(num_keys)]
         payloads = [_make_payload(i, CHUNK_SIZE) for i in range(num_keys)]
 
@@ -372,9 +447,19 @@ class TestTilingShapes:
         finally:
             client.close()
 
+    @pytest.mark.parametrize(
+        "get_batch_mode,exists_batch_mode", MODE_PAIRS, ids=["pipeline", "multikey"]
+    )
     @pytest.mark.parametrize("num_keys,num_workers", SHAPES)
-    def test_no_empty_tiles_when_partially_cached(self, prefix, num_keys, num_workers):
-        client = _SyncClient(num_workers=num_workers, mget_min_keys_per_tile=1)
+    def test_no_empty_tiles_when_partially_cached(
+        self, prefix, num_keys, num_workers, get_batch_mode, exists_batch_mode
+    ):
+        client = _SyncClient(
+            num_workers=num_workers,
+            get_min_keys_per_tile=1,
+            get_batch_mode=get_batch_mode,
+            exists_batch_mode=exists_batch_mode,
+        )
         keys = [f"{prefix}:pshape{i}" for i in range(num_keys)]
         payloads = [_make_payload(i, CHUNK_SIZE) for i in range(num_keys)]
 
@@ -420,11 +505,33 @@ def _command_calls(command: str) -> int:
 class TestTilingPolicy:
     """Verify the command counts produced by RedisConnector::choose_num_tiles:
     EXISTS collapses to one multi-key command, GET splits by the
-    mget_min_keys_per_tile floor."""
+    get_min_keys_per_tile floor."""
 
-    def test_exists_uses_one_command(self, prefix):
+    def test_exists_pipeline_mode_uses_per_key_commands(self, prefix):
+        """Pipeline mode (default): N single-key EXISTS commands in one
+        round trip, regardless of hit pattern."""
         client = _SyncClient(num_workers=8)
         keys = [f"{prefix}:pol{i}" for i in range(9)]
+        payloads = [_make_payload(i, CHUNK_SIZE) for i in range(9)]
+
+        try:
+            ok, err, _ = client.batch_set(keys, payloads)
+            assert ok, err
+            ok, err, _ = client.batch_delete(keys[:4])
+            assert ok, err
+
+            before = _command_calls("exists")
+            ok, err, results = client.batch_exists(keys)
+            assert ok, err
+            assert results == [False] * 4 + [True] * 5
+            assert _command_calls("exists") - before == 9
+        finally:
+            client.batch_delete(keys)
+            client.close()
+
+    def test_exists_multikey_fully_cached_uses_one_command(self, prefix):
+        client = _SyncClient(num_workers=8, exists_batch_mode="multikey")
+        keys = [f"{prefix}:polm{i}" for i in range(9)]
         payloads = [_make_payload(i, CHUNK_SIZE) for i in range(9)]
 
         try:
@@ -441,8 +548,8 @@ class TestTilingPolicy:
             client.batch_delete(keys)
             client.close()
 
-    def test_exists_partial_pipelines_per_key(self, prefix):
-        client = _SyncClient(num_workers=8)
+    def test_exists_multikey_partial_pipelines_per_key(self, prefix):
+        client = _SyncClient(num_workers=8, exists_batch_mode="multikey")
         keys = [f"{prefix}:polp{i}" for i in range(9)]
         payloads = [_make_payload(i, CHUNK_SIZE) for i in range(9)]
 
@@ -474,7 +581,11 @@ class TestTilingPolicy:
     def test_mget_respects_min_keys_per_tile(
         self, prefix, num_keys, min_keys_per_tile, expected_mgets
     ):
-        client = _SyncClient(num_workers=8, mget_min_keys_per_tile=min_keys_per_tile)
+        client = _SyncClient(
+            num_workers=8,
+            get_min_keys_per_tile=min_keys_per_tile,
+            get_batch_mode="mget",
+        )
         keys = [f"{prefix}:polm{i}" for i in range(num_keys)]
         payloads = [_make_payload(i, CHUNK_SIZE) for i in range(num_keys)]
 
@@ -489,6 +600,35 @@ class TestTilingPolicy:
             assert results == [True] * num_keys
             assert bufs == payloads
             assert _command_calls("mget") - before == expected_mgets
+        finally:
+            client.batch_delete(keys)
+            client.close()
+
+    def test_pipeline_mode_uses_single_key_gets(self, prefix):
+        """Pipeline mode issues N single-key GETs (one round trip per tile)
+        and no MGET commands."""
+        num_keys = 32
+        client = _SyncClient(
+            num_workers=8,
+            get_min_keys_per_tile=8,
+            get_batch_mode="pipeline",
+        )
+        keys = [f"{prefix}:polg{i}" for i in range(num_keys)]
+        payloads = [_make_payload(i, CHUNK_SIZE) for i in range(num_keys)]
+
+        try:
+            ok, err, _ = client.batch_set(keys, payloads)
+            assert ok, err
+
+            bufs = [bytearray(CHUNK_SIZE) for _ in keys]
+            gets_before = _command_calls("get")
+            mgets_before = _command_calls("mget")
+            ok, err, results = client.batch_get(keys, bufs)
+            assert ok, err
+            assert results == [True] * num_keys
+            assert bufs == payloads
+            assert _command_calls("get") - gets_before == num_keys
+            assert _command_calls("mget") - mgets_before == 0
         finally:
             client.batch_delete(keys)
             client.close()

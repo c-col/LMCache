@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "connector.h"
+#include <limits.h>
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string_view>
+
+#ifndef IOV_MAX
+  #define IOV_MAX 1024
+#endif
 
 namespace lmcache {
 namespace connector {
@@ -116,7 +121,10 @@ void WorkerConn::send_multipart(
   size_t iov_idx = 0;
 
   while (sent_so_far < total_to_send) {
-    ssize_t n = ::writev(fd, &iov[iov_idx], iov.size() - iov_idx);
+    // writev rejects more than IOV_MAX iovecs with EINVAL; large pipelined
+    // batches (3 parts per key) can exceed it, so clamp per call
+    size_t iov_count = std::min<size_t>(iov.size() - iov_idx, IOV_MAX);
+    ssize_t n = ::writev(fd, &iov[iov_idx], iov_count);
     if (n < 0) {
       if (errno == EINTR) {
         continue;
@@ -291,17 +299,47 @@ break our assumptions and desync the connection. the batched paths
 they tolerate misses and unexpected value sizes per key.
 */
 
+namespace {
+
+GetBatchMode parse_get_batch_mode(const std::string& mode) {
+  if (mode == "pipeline") {
+    return GetBatchMode::PIPELINE;
+  }
+  if (mode == "mget") {
+    return GetBatchMode::MGET;
+  }
+  throw std::runtime_error(
+      "get_batch_mode must be 'pipeline' or 'mget', got '" + mode + "'");
+}
+
+ExistsBatchMode parse_exists_batch_mode(const std::string& mode) {
+  if (mode == "pipeline") {
+    return ExistsBatchMode::PIPELINE;
+  }
+  if (mode == "multikey") {
+    return ExistsBatchMode::MULTIKEY;
+  }
+  throw std::runtime_error(
+      "exists_batch_mode must be 'pipeline' or 'multikey', got '" + mode + "'");
+}
+
+}  // namespace
+
 RedisConnector::RedisConnector(std::string host, int port, int num_workers,
                                std::string username, std::string password,
-                               size_t mget_min_keys_per_tile)
+                               size_t get_min_keys_per_tile,
+                               std::string get_batch_mode,
+                               std::string exists_batch_mode)
     : ConnectorBase(num_workers),
       host_(std::move(host)),
       port_(port),
       username_(std::move(username)),
       password_(std::move(password)),
-      mget_min_keys_per_tile_(mget_min_keys_per_tile) {
-  if (mget_min_keys_per_tile_ == 0) {
-    throw std::runtime_error("mget_min_keys_per_tile must be >= 1");
+      get_min_keys_per_tile_(get_min_keys_per_tile),
+      get_batch_mode_(parse_get_batch_mode(get_batch_mode)),
+      exists_batch_mode_(parse_exists_batch_mode(exists_batch_mode)) {
+  if (get_min_keys_per_tile_ == 0) {
+    throw std::runtime_error("get_min_keys_per_tile must be >= 1");
   }
   worker_fds_.reserve(num_workers);
   start_workers();  // start after derived class is fully constructed
@@ -445,23 +483,117 @@ bool RedisConnector::do_single_delete(WorkerConn& conn,
   }
 }
 
+void RedisConnector::do_batch_get(WorkerConn& conn, const Request& req) {
+  if (req.keys.empty()) {
+    return;  // empty tile: nothing to send
+  }
+  if (get_batch_mode_ == GetBatchMode::MGET) {
+    do_batch_get_mget(conn, req);
+  } else {
+    do_batch_get_pipelined(conn, req);
+  }
+}
+
+// shared bulk-string value handling for both do_batch_get strategies.
+// unlike do_single_get, misses and size mismatches are handled per key: the
+// unusable payload is drained so the connection stays in protocol sync, the
+// key's result is marked 0, and the rest of the batch proceeds. only
+// protocol or socket level failures throw (failing the whole tile).
+void RedisConnector::consume_bulk_value(WorkerConn& conn, const Request& req,
+                                        size_t i, int64_t value_len,
+                                        const char* op_name) {
+  if (value_len < 0) {
+    // $-1\r\n: key does not exist (no payload or trailer follows)
+    req.batch->per_key_results[req.start_idx + i] = 0;
+    fprintf(stderr, "[LMCache GET] key %s failed: not found\n",
+            req.keys[i].c_str());
+    return;
+  }
+
+  if (static_cast<size_t>(value_len) == req.buf_lens[i] &&
+      req.buf_lens[i] == req.batch_chunk_num_bytes) {
+    conn.recv_exactly(req.buf_ptrs[i], static_cast<size_t>(value_len));
+    req.batch->per_key_results[req.start_idx + i] = 1;
+  } else {
+    // stored value does not fit the destination buffer; consume it so
+    // later replies still parse, and fail just this key
+    conn.drain_exactly(static_cast<size_t>(value_len));
+    req.batch->per_key_results[req.start_idx + i] = 0;
+    fprintf(stderr,
+            "[LMCache GET] key %s failed: size mismatch (value %lld bytes, "
+            "buffer %zu bytes, chunk %zu bytes)\n",
+            req.keys[i].c_str(), static_cast<long long>(value_len),
+            req.buf_lens[i], req.batch_chunk_num_bytes);
+  }
+
+  // payload trailer
+  char trailer[WorkerConn::crlf_len];
+  conn.recv_exactly(trailer, WorkerConn::crlf_len);
+  if (std::memcmp(trailer, WorkerConn::crlf.data(), WorkerConn::crlf_len) !=
+      0) {
+    throw std::runtime_error(std::string(op_name) + ": trailer mismatch");
+  }
+}
+
 /*
-batched GET via MGET.
+batched GET, pipeline mode (default).
+
+wire format (request):  N x  *2\r\n$3\r\nGET\r\n$<len>\r\n<key>\r\n
+wire format (reply):    N x  ($-1\r\n | $<len>\r\n<payload>\r\n | -<err>\r\n)
+
+same round-trip savings as MGET, but each GET executes and is routed
+independently: cross-slot batches work on Redis Cluster and the server can
+interleave other clients' commands between keys instead of holding the event
+loop for one atomic multi-key command. per-key server error replies (e.g.
+WRONGTYPE) fail only that key; the error line is fully consumed so the
+remaining replies still parse.
+*/
+void RedisConnector::do_batch_get_pipelined(WorkerConn& conn,
+                                            const Request& req) {
+  const size_t num_keys = req.keys.size();
+
+  // 1. one pipelined write of N single-key GET commands
+  std::string pipeline;
+  size_t needed = 0;
+  for (const auto& key : req.keys) {
+    needed += conn.get_prefix.size() + key.size() + 16;
+  }
+  pipeline.reserve(needed);
+  for (const auto& key : req.keys) {
+    pipeline += conn.get_prefix;
+    pipeline += conn.make_key_header(key);
+  }
+  conn.send_all(pipeline.data(), pipeline.size());
+
+  // 2. N replies
+  for (size_t i = 0; i < num_keys; ++i) {
+    std::string line = conn.recv_line();
+    if (!line.empty() && line[0] == '-') {
+      // per-key server error; recv_line consumed the full error line, so
+      // the connection stays in sync for the remaining replies
+      req.batch->per_key_results[req.start_idx + i] = 0;
+      fprintf(stderr, "[LMCache GET] key %s failed: %s\n", req.keys[i].c_str(),
+              line.substr(1, line.size() - 3).c_str());
+      continue;
+    }
+    int64_t value_len = parse_reply_int(line, '$', "GET");
+    consume_bulk_value(conn, req, i, value_len, "GET");
+  }
+}
+
+/*
+batched GET, mget mode.
 
 wire format (request):  *<N+1>\r\n$4\r\nMGET\r\n$<len>\r\n<key>\r\n ...
 wire format (reply):    *<N>\r\n then per key either $-1\r\n (miss) or
                         $<len>\r\n<payload>\r\n (hit)
 
-unlike do_single_get, misses and size mismatches are handled per key: the
-unusable payload is drained so the connection stays in protocol sync, the
-key's result is marked 0, and the rest of the batch proceeds. only protocol
-or socket level failures throw (failing the whole tile).
+one command per tile: slightly fewer reply bytes than the pipeline mode, but
+the command executes atomically (holding the single-threaded event loop for
+the whole tile) and cross-slot batches fail on Redis Cluster.
 */
-void RedisConnector::do_batch_get(WorkerConn& conn, const Request& req) {
+void RedisConnector::do_batch_get_mget(WorkerConn& conn, const Request& req) {
   const size_t num_keys = req.keys.size();
-  if (num_keys == 0) {
-    return;  // RESP has no zero-key MGET; nothing to do
-  }
 
   const std::string& cmd =
       conn.build_multikey_command(WorkerConn::mget_cmd_part, req.keys);
@@ -478,43 +610,108 @@ void RedisConnector::do_batch_get(WorkerConn& conn, const Request& req) {
   // 2. per-key bulk strings
   for (size_t i = 0; i < num_keys; ++i) {
     int64_t value_len = parse_reply_int(conn.recv_line(), '$', "MGET");
-
-    if (value_len < 0) {
-      // $-1\r\n: key does not exist (no payload or trailer follows)
-      req.batch->per_key_results[req.start_idx + i] = 0;
-      fprintf(stderr, "[LMCache GET] key %s failed: not found\n",
-              req.keys[i].c_str());
-      continue;
-    }
-
-    if (static_cast<size_t>(value_len) == req.buf_lens[i] &&
-        req.buf_lens[i] == req.batch_chunk_num_bytes) {
-      conn.recv_exactly(req.buf_ptrs[i], static_cast<size_t>(value_len));
-      req.batch->per_key_results[req.start_idx + i] = 1;
-    } else {
-      // stored value does not fit the destination buffer; consume it so
-      // later replies still parse, and fail just this key
-      conn.drain_exactly(static_cast<size_t>(value_len));
-      req.batch->per_key_results[req.start_idx + i] = 0;
-      fprintf(stderr,
-              "[LMCache GET] key %s failed: size mismatch (value %lld bytes, "
-              "buffer %zu bytes, chunk %zu bytes)\n",
-              req.keys[i].c_str(), static_cast<long long>(value_len),
-              req.buf_lens[i], req.batch_chunk_num_bytes);
-    }
-
-    // 3. payload trailer
-    char trailer[WorkerConn::crlf_len];
-    conn.recv_exactly(trailer, WorkerConn::crlf_len);
-    if (std::memcmp(trailer, WorkerConn::crlf.data(), WorkerConn::crlf_len) !=
-        0) {
-      throw std::runtime_error("MGET: trailer mismatch");
-    }
+    consume_bulk_value(conn, req, i, value_len, "MGET");
   }
 }
 
 /*
-batched EXISTS via the multi-key EXISTS command.
+batched SET via pipelining: one scatter-gather write of N SET commands
+(payloads referenced zero-copy via iovec), then N status replies.
+
+wire format (request):  N x  *3\r\n$3\r\nSET\r\n$<klen>\r\n<key>\r\n
+                             $<vlen>\r\n<payload>\r\n
+wire format (reply):    N x  (+OK\r\n | -<err>\r\n)
+
+replaces the base per-key loop (N round trips per tile) with one round trip.
+error replies are recorded but every reply is consumed before throwing so
+the connection stays usable for the next request; any failed key fails the
+tile (and thus the batch), matching the per-key-loop semantics where the
+first SET failure fails the batch.
+*/
+void RedisConnector::do_batch_set(WorkerConn& conn, const Request& req) {
+  const size_t num_keys = req.keys.size();
+  if (num_keys == 0) {
+    return;  // empty tile: nothing to send
+  }
+
+  // we only write exactly batch_chunk_num_bytes bytes per key
+  // (save_unfull_chunk must be off); validate before sending anything
+  for (size_t i = 0; i < num_keys; ++i) {
+    if (req.buf_lens[i] != req.batch_chunk_num_bytes) {
+      throw std::runtime_error("buffer size mismatch");
+    }
+  }
+
+  const std::string& size_header =
+      conn.make_size_header(req.batch_chunk_num_bytes);
+
+  // 1. build per-key command headers first (the parts vector stores raw
+  // pointers into them, so all string construction must finish before any
+  // pointer is taken)
+  std::vector<std::string> headers;
+  headers.reserve(num_keys);
+  for (size_t i = 0; i < num_keys; ++i) {
+    std::string hdr;
+    hdr.reserve(conn.set_prefix.size() + req.keys[i].size() +
+                size_header.size() + 16);
+    hdr += conn.set_prefix;
+    hdr += '$';
+    hdr += std::to_string(req.keys[i].size());
+    hdr += WorkerConn::crlf;
+    hdr += req.keys[i];
+    hdr += WorkerConn::crlf;
+    hdr += size_header;
+    headers.push_back(std::move(hdr));
+  }
+
+  // 2. one scatter-gather write: header + payload + trailer per key
+  std::vector<std::pair<const void*, size_t>> parts;
+  parts.reserve(num_keys * 3);
+  for (size_t i = 0; i < num_keys; ++i) {
+    parts.push_back({headers[i].data(), headers[i].size()});
+    parts.push_back({req.buf_ptrs[i], req.buf_lens[i]});
+    parts.push_back({WorkerConn::crlf.data(), WorkerConn::crlf_len});
+  }
+  conn.send_multipart(parts);
+
+  // 3. N status replies; consume all of them before throwing so a failed
+  // key does not leave unread replies desyncing the connection
+  std::string first_error;
+  for (size_t i = 0; i < num_keys; ++i) {
+    std::string line = conn.recv_line();
+    if (line.size() == WorkerConn::ok_response_len &&
+        std::memcmp(line.data(), WorkerConn::ok_response.data(),
+                    WorkerConn::ok_response_len) == 0) {
+      continue;
+    }
+    if (first_error.empty()) {
+      if (!line.empty() && line[0] == '-') {
+        first_error = "SET: key " + req.keys[i] +
+                      " failed: " + line.substr(1, line.size() - 3);
+      } else {
+        first_error =
+            "SET: key " + req.keys[i] + " failed: unexpected reply: " + line;
+      }
+    }
+  }
+  if (!first_error.empty()) {
+    throw std::runtime_error(first_error);
+  }
+}
+
+void RedisConnector::do_batch_exists(WorkerConn& conn, const Request& req) {
+  if (req.keys.empty()) {
+    return;  // empty tile: nothing to send
+  }
+  if (exists_batch_mode_ == ExistsBatchMode::MULTIKEY) {
+    do_batch_exists_multikey(conn, req);
+  } else {
+    do_batch_exists_pipelined(conn, req);
+  }
+}
+
+/*
+batched EXISTS, multikey mode.
 
 wire format (request):  *<N+1>\r\n$6\r\nEXISTS\r\n$<len>\r\n<key>\r\n ...
 wire format (reply):    :<count>\r\n
@@ -525,12 +722,11 @@ means none do — both exact even with duplicate keys. those two cases resolve
 the whole tile in one round trip, which covers the common lookup patterns
 (fully cached or fully uncached prefix). a partial count carries no per-key
 information, so we fall back to one pipelined round of single-key EXISTS.
+cross-slot batches fail on Redis Cluster.
 */
-void RedisConnector::do_batch_exists(WorkerConn& conn, const Request& req) {
+void RedisConnector::do_batch_exists_multikey(WorkerConn& conn,
+                                              const Request& req) {
   const size_t num_keys = req.keys.size();
-  if (num_keys == 0) {
-    return;  // RESP has no zero-key EXISTS; nothing to do
-  }
 
   const std::string& cmd =
       conn.build_multikey_command(WorkerConn::exists_cmd_part, req.keys);
@@ -551,12 +747,22 @@ void RedisConnector::do_batch_exists(WorkerConn& conn, const Request& req) {
       req.batch->per_key_results[req.start_idx + i] = 0;
     }
   } else {
-    resolve_partial_exists(conn, req);
+    do_batch_exists_pipelined(conn, req);
   }
 }
 
-void RedisConnector::resolve_partial_exists(WorkerConn& conn,
-                                            const Request& req) {
+/*
+batched EXISTS, pipeline mode (default; also the multikey mode's per-key
+fallback for partially-cached tiles).
+
+wire format (request):  N x  *2\r\n$6\r\nEXISTS\r\n$<len>\r\n<key>\r\n
+wire format (reply):    N x  (:0\r\n | :1\r\n)
+
+per-key results in one round trip; each command executes and is routed
+independently, so cross-slot batches work on Redis Cluster.
+*/
+void RedisConnector::do_batch_exists_pipelined(WorkerConn& conn,
+                                               const Request& req) {
   const size_t num_keys = req.keys.size();
 
   // one pipelined write of N single-key EXISTS commands
@@ -601,7 +807,7 @@ multi-key EXISTS, splitting small batches only fragments them into degenerate
   no payload transfer to parallelize — always use 1 tile (one command).
 - GET: keep fan-out for payload-heavy batches (parallel sockets overlap
   transfer, and one giant MGET would hold single-threaded Redis longer), but
-  require at least mget_min_keys_per_tile_ keys per tile before adding more
+  require at least get_min_keys_per_tile_ keys per tile before adding more
   connections.
 - SET / DELETE: still per-key commands, so fewer tiles would cut parallelism
   with no round-trip savings — keep the base default.
@@ -614,7 +820,7 @@ size_t RedisConnector::choose_num_tiles(Op op, size_t num_items) const {
       return 1;
     case Op::BATCH_TILE_GET: {
       const size_t tiles_by_floor =
-          (num_items + mget_min_keys_per_tile_ - 1) / mget_min_keys_per_tile_;
+          (num_items + get_min_keys_per_tile_ - 1) / get_min_keys_per_tile_;
       return std::max<size_t>(1, std::min(max_tiles, tiles_by_floor));
     }
     default:

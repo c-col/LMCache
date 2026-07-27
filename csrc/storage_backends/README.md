@@ -178,25 +178,50 @@ implementations:
   `choose_num_tiles` to return 1 since the library parallelizes internally.
 - **Redis** (`redis/connector.cpp`): implements the batching at the RESP
   protocol level with a per-op tiling policy (`choose_num_tiles`): EXISTS
-  always uses 1 tile (the reply is a single integer — nothing to
-  parallelize), GET requires at least `mget_min_keys_per_tile` keys per tile
-  before fanning out to more connections (constructor arg, default 8;
-  exposed as `resp_mget_min_keys_per_tile` in non-MP `extra_config` and
-  `mget_min_keys_per_tile` in the MP `resp` L2 adapter config), and
-  SET/DELETE keep the default fan-out since they are still per-key commands:
-  - `do_batch_get` issues one `MGET k1 .. kN` per tile. Misses (`$-1` nil
-    replies) and size-mismatched values are tolerated per key: the unusable
-    payload is drained so the connection stays in protocol sync, only that
-    key's result is marked failed. (The single-key `do_single_get` cannot
-    recover this way — a miss desyncs its connection — so the batch path is
-    both faster and more robust.)
-  - `do_batch_exists` issues one multi-key `EXISTS k1 .. kN` per tile.
-    `EXISTS` replies with a single count, counting each argument position
-    independently, so `count == N` (all cached) and `count == 0` (none
-    cached) resolve the tile in one round trip — the common lookup patterns.
-    A partial count carries no per-key information, so the connector falls
-    back to one pipelined round of single-key `EXISTS` commands (still a
-    single extra round trip, not N).
+  always uses 1 tile (replies are tiny — nothing to parallelize), GET
+  requires at least `get_min_keys_per_tile` keys per tile before fanning out
+  to more connections (constructor arg, default 8, applies to both GET
+  modes; exposed as `resp_get_min_keys_per_tile` in non-MP `extra_config`
+  and `get_min_keys_per_tile` in the MP `resp` L2 adapter config), and
+  SET/DELETE keep the default fan-out:
+  - `do_batch_get` executes each tile in one round trip using one of two
+    wire strategies selected by `get_batch_mode` (constructor arg; exposed
+    as `resp_get_batch_mode` in non-MP `extra_config` and `get_batch_mode`
+    in the MP `resp` L2 adapter config):
+    - `"pipeline"` (default): N single-key `GET` commands written in one
+      batch, then N replies. Each command executes and is routed
+      independently — cross-slot batches work on Redis Cluster, the server
+      can interleave other clients between keys, and per-key error replies
+      (e.g. `WRONGTYPE`) fail only that key.
+    - `"mget"`: one `MGET k1 .. kN` per tile. Slightly fewer reply bytes,
+      but the command executes atomically (holding the single-threaded
+      event loop for the whole tile) and cross-slot batches fail on Redis
+      Cluster.
+    In both modes misses (`$-1` nil replies) and size-mismatched values are
+    tolerated per key: the unusable payload is drained so the connection
+    stays in protocol sync, only that key's result is marked failed. (The
+    single-key `do_single_get` cannot recover this way — a miss desyncs its
+    connection — so the batch paths are both faster and more robust.)
+  - `do_batch_set` pipelines a whole tile: one scatter-gather write of N
+    `SET` commands (payloads referenced zero-copy via iovec), then N status
+    replies — one round trip per tile instead of N. On an error reply the
+    remaining replies are still consumed before the tile is failed, so the
+    connection stays usable.
+  - `do_batch_exists` executes each tile in one round trip using one of two
+    strategies selected by `exists_batch_mode` (constructor arg; exposed as
+    `resp_exists_batch_mode` in non-MP `extra_config` and
+    `exists_batch_mode` in the MP `resp` L2 adapter config):
+    - `"pipeline"` (default): N single-key `EXISTS` commands written in one
+      batch, then N `:0`/`:1` replies — per-key results in one round trip,
+      cluster-safe.
+    - `"multikey"`: one multi-key `EXISTS k1 .. kN` per tile. `EXISTS`
+      replies with a single count, counting each argument position
+      independently, so `count == N` (all cached) and `count == 0` (none
+      cached) resolve the tile in one tiny round trip — the common lookup
+      patterns. A partial count carries no per-key information, so the
+      connector falls back to one pipelined round of single-key `EXISTS`
+      commands (one extra round trip, not N). Cross-slot batches fail on
+      Redis Cluster.
 
 Contract for `do_batch_get` / `do_batch_exists` / `do_batch_delete`
 overrides: write per-key outcomes (1/0) into

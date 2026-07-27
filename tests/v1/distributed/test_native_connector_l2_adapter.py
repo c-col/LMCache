@@ -784,7 +784,9 @@ class TestRESPL2AdapterConfig:
         assert config.num_workers == 8
         assert config.username == ""
         assert config.password == ""
-        assert config.mget_min_keys_per_tile == 8
+        assert config.get_min_keys_per_tile == 8
+        assert config.get_batch_mode == "pipeline"
+        assert config.exists_batch_mode == "pipeline"
 
     def test_from_dict_full(self):
         # First Party
@@ -800,7 +802,9 @@ class TestRESPL2AdapterConfig:
                 "num_workers": 16,
                 "username": "user",
                 "password": "pass",
-                "mget_min_keys_per_tile": 4,
+                "get_min_keys_per_tile": 4,
+                "get_batch_mode": "mget",
+                "exists_batch_mode": "multikey",
             }
         )
         assert config.host == "10.0.0.1"
@@ -808,21 +812,65 @@ class TestRESPL2AdapterConfig:
         assert config.num_workers == 16
         assert config.username == "user"
         assert config.password == "pass"
-        assert config.mget_min_keys_per_tile == 4
+        assert config.get_min_keys_per_tile == 4
+        assert config.get_batch_mode == "mget"
+        assert config.exists_batch_mode == "multikey"
 
-    def test_from_dict_invalid_mget_min_keys_per_tile_raises(self):
+    def test_from_dict_invalid_get_min_keys_per_tile_raises(self):
         # First Party
         from lmcache.v1.distributed.l2_adapters.resp_l2_adapter import (
             RESPL2AdapterConfig,
         )
 
-        with pytest.raises(ValueError, match="mget_min_keys_per_tile"):
+        with pytest.raises(ValueError, match="get_min_keys_per_tile"):
             RESPL2AdapterConfig.from_dict(
                 {
                     "type": "resp",
                     "host": "localhost",
                     "port": 6379,
-                    "mget_min_keys_per_tile": 0,
+                    "get_min_keys_per_tile": 0,
+                }
+            )
+
+    def test_from_dict_renamed_key_raises(self):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.resp_l2_adapter import (
+            RESPL2AdapterConfig,
+        )
+
+        with pytest.raises(ValueError, match="renamed to get_min_keys_per_tile"):
+            RESPL2AdapterConfig.from_dict(
+                {
+                    "type": "resp",
+                    "host": "localhost",
+                    "port": 6379,
+                    "mget_min_keys_per_tile": 4,
+                }
+            )
+
+    def test_from_dict_invalid_batch_modes_raise(self):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.resp_l2_adapter import (
+            RESPL2AdapterConfig,
+        )
+
+        with pytest.raises(ValueError, match="get_batch_mode"):
+            RESPL2AdapterConfig.from_dict(
+                {
+                    "type": "resp",
+                    "host": "localhost",
+                    "port": 6379,
+                    "get_batch_mode": "bogus",
+                }
+            )
+
+        with pytest.raises(ValueError, match="exists_batch_mode"):
+            RESPL2AdapterConfig.from_dict(
+                {
+                    "type": "resp",
+                    "host": "localhost",
+                    "port": 6379,
+                    "exists_batch_mode": "bogus",
                 }
             )
 
