@@ -1,12 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "connector.h"
+#include <algorithm>
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string_view>
 
 namespace lmcache {
 namespace connector {
+
+namespace {
+
+// parse a RESP reply line of the form <prefix><integer>\r\n (e.g. ":3\r\n",
+// "*128\r\n", "$-1\r\n"). Surfaces server error replies ("-ERR ...\r\n") as
+// exceptions with the server message. Throws on any other malformed line.
+int64_t parse_reply_int(const std::string& line, char expected_prefix,
+                        const char* op_name) {
+  // recv_line guarantees the line ends with \r\n, so size() >= 2
+  if (line.size() < 3) {
+    throw std::runtime_error(std::string(op_name) + ": reply line too short");
+  }
+  if (line[0] == '-') {
+    // server error reply; strip prefix and trailing \r\n for the message
+    throw std::runtime_error(std::string(op_name) + ": server error: " +
+                             line.substr(1, line.size() - 3));
+  }
+  if (line[0] != expected_prefix) {
+    throw std::runtime_error(std::string(op_name) +
+                             ": unexpected reply type: " + line);
+  }
+  errno = 0;
+  char* end = nullptr;
+  long long value = std::strtoll(line.c_str() + 1, &end, 10);
+  if (errno != 0 || end != line.c_str() + line.size() - WorkerConn::crlf_len) {
+    throw std::runtime_error(std::string(op_name) +
+                             ": malformed integer reply: " + line);
+  }
+  return static_cast<int64_t>(value);
+}
+
+}  // namespace
 
 void WorkerConn::connect(const std::string& h, int p) {
   host = h;
@@ -128,6 +163,17 @@ void WorkerConn::recv_exactly(void* buf, size_t len) {
   }
 }
 
+// read and discard exactly len bytes (used to consume unusable bulk payloads
+// so the connection stays in protocol sync)
+void WorkerConn::drain_exactly(size_t len) {
+  char scratch[8192];
+  while (len > 0) {
+    size_t chunk = std::min(len, sizeof(scratch));
+    recv_exactly(scratch, chunk);
+    len -= chunk;
+  }
+}
+
 std::string WorkerConn::recv_line() {
   std::string line;
   line.reserve(128);
@@ -209,10 +255,40 @@ const std::string& WorkerConn::make_size_header(size_t batch_chunk_num_bytes) {
   return size_header_buf;
 }
 
+const std::string& WorkerConn::build_multikey_command(
+    std::string_view cmd_part, const std::vector<std::string>& keys) {
+  cmd_buf.clear();
+
+  // *<argc>\r\n + cmd_part + per key: $<len>\r\n<key>\r\n (~16 bytes overhead)
+  size_t needed = 16 + cmd_part.size();
+  for (const auto& key : keys) {
+    needed += key.size() + 16;
+  }
+  if (needed > cmd_buf.capacity()) {
+    cmd_buf.reserve(needed);
+  }
+
+  cmd_buf += '*';
+  cmd_buf += std::to_string(keys.size() + 1);
+  cmd_buf += crlf;
+  cmd_buf += cmd_part;
+  for (const auto& key : keys) {
+    cmd_buf += '$';
+    cmd_buf += std::to_string(key.size());
+    cmd_buf += crlf;
+    cmd_buf += key;
+    cmd_buf += crlf;
+  }
+
+  return cmd_buf;
+}
+
 /*
-RESP set, get, exists are very fragile here since we make hard assumptions about
-the RESP responses. a single error could break our assumptions. we can mitigate
-this by actually parsing the headers and trailers.
+the single-key RESP set, get, exists below are fragile since we make hard
+assumptions about the RESP responses. a single error (e.g. a GET miss) could
+break our assumptions and desync the connection. the batched paths
+(do_batch_get / do_batch_exists further down) instead parse reply headers, so
+they tolerate misses and unexpected value sizes per key.
 */
 
 RedisConnector::RedisConnector(std::string host, int port, int num_workers,
@@ -361,6 +437,146 @@ bool RedisConnector::do_single_delete(WorkerConn& conn,
   } else {
     throw std::runtime_error(
         "DEL returned invalid response that wasn't :0\r\n or :1\r\n");
+  }
+}
+
+/*
+batched GET via MGET.
+
+wire format (request):  *<N+1>\r\n$4\r\nMGET\r\n$<len>\r\n<key>\r\n ...
+wire format (reply):    *<N>\r\n then per key either $-1\r\n (miss) or
+                        $<len>\r\n<payload>\r\n (hit)
+
+unlike do_single_get, misses and size mismatches are handled per key: the
+unusable payload is drained so the connection stays in protocol sync, the
+key's result is marked 0, and the rest of the batch proceeds. only protocol
+or socket level failures throw (failing the whole tile).
+*/
+void RedisConnector::do_batch_get(WorkerConn& conn, const Request& req) {
+  const size_t num_keys = req.keys.size();
+
+  const std::string& cmd =
+      conn.build_multikey_command(WorkerConn::mget_cmd_part, req.keys);
+  conn.send_all(cmd.data(), cmd.size());
+
+  // 1. array header: *<N>\r\n
+  int64_t num_replies = parse_reply_int(conn.recv_line(), '*', "MGET");
+  if (num_replies != static_cast<int64_t>(num_keys)) {
+    throw std::runtime_error("MGET: reply count mismatch: expected " +
+                             std::to_string(num_keys) + ", got " +
+                             std::to_string(num_replies));
+  }
+
+  // 2. per-key bulk strings
+  for (size_t i = 0; i < num_keys; ++i) {
+    int64_t value_len = parse_reply_int(conn.recv_line(), '$', "MGET");
+
+    if (value_len < 0) {
+      // $-1\r\n: key does not exist (no payload or trailer follows)
+      req.batch->per_key_results[req.start_idx + i] = 0;
+      fprintf(stderr, "[LMCache GET] key %s failed: not found\n",
+              req.keys[i].c_str());
+      continue;
+    }
+
+    if (static_cast<size_t>(value_len) == req.buf_lens[i] &&
+        req.buf_lens[i] == req.batch_chunk_num_bytes) {
+      conn.recv_exactly(req.buf_ptrs[i], static_cast<size_t>(value_len));
+      req.batch->per_key_results[req.start_idx + i] = 1;
+    } else {
+      // stored value does not fit the destination buffer; consume it so
+      // later replies still parse, and fail just this key
+      conn.drain_exactly(static_cast<size_t>(value_len));
+      req.batch->per_key_results[req.start_idx + i] = 0;
+      fprintf(stderr,
+              "[LMCache GET] key %s failed: size mismatch (value %lld bytes, "
+              "buffer %zu bytes, chunk %zu bytes)\n",
+              req.keys[i].c_str(), static_cast<long long>(value_len),
+              req.buf_lens[i], req.batch_chunk_num_bytes);
+    }
+
+    // 3. payload trailer
+    char trailer[WorkerConn::crlf_len];
+    conn.recv_exactly(trailer, WorkerConn::crlf_len);
+    if (std::memcmp(trailer, WorkerConn::crlf.data(), WorkerConn::crlf_len) !=
+        0) {
+      throw std::runtime_error("MGET: trailer mismatch");
+    }
+  }
+}
+
+/*
+batched EXISTS via the multi-key EXISTS command.
+
+wire format (request):  *<N+1>\r\n$6\r\nEXISTS\r\n$<len>\r\n<key>\r\n ...
+wire format (reply):    :<count>\r\n
+
+EXISTS counts each argument position independently (a key passed twice that
+exists counts twice), so count == N means every key exists and count == 0
+means none do — both exact even with duplicate keys. those two cases resolve
+the whole tile in one round trip, which covers the common lookup patterns
+(fully cached or fully uncached prefix). a partial count carries no per-key
+information, so we fall back to one pipelined round of single-key EXISTS.
+*/
+void RedisConnector::do_batch_exists(WorkerConn& conn, const Request& req) {
+  const size_t num_keys = req.keys.size();
+
+  const std::string& cmd =
+      conn.build_multikey_command(WorkerConn::exists_cmd_part, req.keys);
+  conn.send_all(cmd.data(), cmd.size());
+
+  int64_t count = parse_reply_int(conn.recv_line(), ':', "EXISTS");
+  if (count < 0 || count > static_cast<int64_t>(num_keys)) {
+    throw std::runtime_error("EXISTS: count out of range: " +
+                             std::to_string(count));
+  }
+
+  if (count == static_cast<int64_t>(num_keys)) {
+    for (size_t i = 0; i < num_keys; ++i) {
+      req.batch->per_key_results[req.start_idx + i] = 1;
+    }
+  } else if (count == 0) {
+    for (size_t i = 0; i < num_keys; ++i) {
+      req.batch->per_key_results[req.start_idx + i] = 0;
+    }
+  } else {
+    resolve_partial_exists(conn, req);
+  }
+}
+
+void RedisConnector::resolve_partial_exists(WorkerConn& conn,
+                                            const Request& req) {
+  const size_t num_keys = req.keys.size();
+
+  // one pipelined write of N single-key EXISTS commands
+  std::string pipeline;
+  size_t needed = 0;
+  for (const auto& key : req.keys) {
+    needed += conn.exists_prefix.size() + key.size() + 16;
+  }
+  pipeline.reserve(needed);
+  for (const auto& key : req.keys) {
+    pipeline += conn.exists_prefix;
+    pipeline += conn.make_key_header(key);
+  }
+  conn.send_all(pipeline.data(), pipeline.size());
+
+  // N integer replies, each exactly :0\r\n or :1\r\n
+  for (size_t i = 0; i < num_keys; ++i) {
+    char response[WorkerConn::exists_response_len];
+    conn.recv_exactly(response, WorkerConn::exists_response_len);
+
+    if (std::memcmp(response, WorkerConn::exists_one.data(),
+                    WorkerConn::exists_response_len) == 0) {
+      req.batch->per_key_results[req.start_idx + i] = 1;
+    } else if (std::memcmp(response, WorkerConn::exists_zero.data(),
+                           WorkerConn::exists_response_len) == 0) {
+      req.batch->per_key_results[req.start_idx + i] = 0;
+    } else {
+      throw std::runtime_error(
+          "EXISTS pipeline returned invalid response that wasn't :0\r\n or "
+          ":1\r\n");
+    }
   }
 }
 

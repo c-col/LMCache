@@ -36,9 +36,15 @@ struct WorkerConn {
   std::string exists_prefix;
   std::string del_prefix;
 
+  // command-name elements (without the leading *<argc>\r\n array header) for
+  // building variadic multi-key commands like EXISTS k1..kN and MGET k1..kN
+  static constexpr std::string_view exists_cmd_part = "$6\r\nEXISTS\r\n";
+  static constexpr std::string_view mget_cmd_part = "$4\r\nMGET\r\n";
+
   // reusable buffers for building headers (avoids repeated dynamic allocations)
   std::string key_header_buf;
   std::string size_header_buf;
+  std::string cmd_buf;
 
   // pre-computed constants (for comparisons)
   static constexpr std::string_view crlf = "\r\n";
@@ -85,9 +91,17 @@ struct WorkerConn {
   void send_all(const void* data, size_t len);
   void send_multipart(const std::vector<std::pair<const void*, size_t>>& parts);
   void recv_exactly(void* buf, size_t len);
+  void drain_exactly(size_t len);
   std::string recv_line();
   const std::string& make_key_header(const std::string& key);
   const std::string& make_size_header(size_t batch_chunk_num_bytes);
+
+  // build a single-buffer variadic command:
+  //   *<N+1>\r\n<cmd_part>$<len(k1)>\r\nk1\r\n ... $<len(kN)>\r\nkN\r\n
+  // where cmd_part is one of the *_cmd_part constants above. The returned
+  // reference points into cmd_buf and is invalidated by the next call.
+  const std::string& build_multikey_command(
+      std::string_view cmd_part, const std::vector<std::string>& keys);
 };
 
 class RedisConnector : public ConnectorBase<WorkerConn> {
@@ -104,9 +118,19 @@ class RedisConnector : public ConnectorBase<WorkerConn> {
                      size_t len, size_t chunk_size) override;
   bool do_single_exists(WorkerConn& conn, const std::string& key) override;
   bool do_single_delete(WorkerConn& conn, const std::string& key) override;
+
+  // batch overrides using Redis multi-key commands (one round trip per tile
+  // instead of one per key). See connector.cpp for the RESP wire details.
+  void do_batch_get(WorkerConn& conn, const Request& req) override;
+  void do_batch_exists(WorkerConn& conn, const Request& req) override;
+
   void shutdown_connections() override;
 
  private:
+  // per-key resolution for a partially-cached EXISTS batch: one pipelined
+  // write of N single-key EXISTS commands followed by N integer replies
+  void resolve_partial_exists(WorkerConn& conn, const Request& req);
+
   std::string host_;
   int port_;
   std::string username_;

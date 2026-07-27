@@ -150,6 +150,40 @@ What `ConnectorBase` gives you for free:
 - eventfd signaling on completion (kernel wakes Python)
 - Graceful shutdown (stop flag, drain, join)
 
+#### Optional: override `do_batch_*` for native multi-key commands
+
+By default each tile executes as a loop of `do_single_*` calls — one network
+round trip per key. If your backend has native batch/multi-key operations,
+override `do_batch_get` / `do_batch_set` / `do_batch_exists` /
+`do_batch_delete` to execute an entire tile in one round trip. Two reference
+implementations:
+
+- **Mooncake** (`mooncake/connector.cpp`): forwards each tile to the client
+  library's batch APIs (`batch_get_into`, `batchIsExist`, ...) and overrides
+  `choose_num_tiles` to return 1 since the library parallelizes internally.
+- **Redis** (`redis/connector.cpp`): implements the batching at the RESP
+  protocol level, keeping the default tiling (one tile per worker
+  connection):
+  - `do_batch_get` issues one `MGET k1 .. kN` per tile. Misses (`$-1` nil
+    replies) and size-mismatched values are tolerated per key: the unusable
+    payload is drained so the connection stays in protocol sync, only that
+    key's result is marked failed. (The single-key `do_single_get` cannot
+    recover this way — a miss desyncs its connection — so the batch path is
+    both faster and more robust.)
+  - `do_batch_exists` issues one multi-key `EXISTS k1 .. kN` per tile.
+    `EXISTS` replies with a single count, counting each argument position
+    independently, so `count == N` (all cached) and `count == 0` (none
+    cached) resolve the tile in one round trip — the common lookup patterns.
+    A partial count carries no per-key information, so the connector falls
+    back to one pipelined round of single-key `EXISTS` commands (still a
+    single extra round trip, not N).
+
+Contract for `do_batch_get` / `do_batch_exists` / `do_batch_delete`
+overrides: write per-key outcomes (1/0) into
+`req.batch->per_key_results[req.start_idx + i]`; throw only for whole-tile
+failures (protocol/socket errors). `do_batch_set` reports success by not
+throwing.
+
 ### Step 2: Pybind module
 
 Use the `LMCACHE_BIND_CONNECTOR_METHODS` macro which binds all 6 methods
