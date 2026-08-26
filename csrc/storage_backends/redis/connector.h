@@ -109,12 +109,20 @@ enum class GetBatchMode : uint8_t {
   // N single-key GET commands written in one batch, then N replies read
   // back. Same round-trip savings as MGET; each command executes and is
   // routed independently, so cross-slot batches work on Redis Cluster and
-  // the server can interleave other clients between keys.
+  // the server can interleave other clients between keys. This is the only
+  // supported batched mode.
   PIPELINE,
-  // one multi-key MGET command per tile. Slightly fewer reply bytes, but
-  // executes atomically (holds the event loop for the whole tile) and
-  // cross-slot batches fail on Redis Cluster.
+  // DEPRECATED: one multi-key MGET command per tile. Measured no faster than
+  // PIPELINE anywhere, holds the shard event loop for the whole tile,
+  // serializes at the Redis Enterprise proxy, and cross-slot batches fail on
+  // Redis Cluster. Kept selectable for comparison only; never a default or a
+  // fallback.
   MGET,
+  // one blocking GET round trip per key (upstream LMCache's original
+  // behavior). Benchmarking baseline ONLY, for A/B against PIPELINE on
+  // fully-hit keyspaces: a miss desyncs the connection (see do_single_get),
+  // so this is not a production mode.
+  SINGLE,
 };
 
 // how do_batch_exists executes a tile of keys
@@ -131,21 +139,37 @@ enum class ExistsBatchMode : uint8_t {
 
 class RedisConnector : public ConnectorBase<WorkerConn> {
  public:
-  // get_min_keys_per_tile: minimum keys a batched-GET tile should carry
-  // before the batch is split across more worker connections (see
-  // choose_num_tiles). Must be >= 1. Applies to both get_batch_mode
-  // settings. Higher values favor fewer, larger batched commands; lower
-  // values favor connection-level parallelism for payload transfer.
+  // get_min_keys_per_tile: DEPRECATED in favor of get_target_tile_bytes.
+  // Minimum keys a batched-GET tile should carry before the batch is split
+  // across more worker connections (see choose_num_tiles). Must be >= 1. At
+  // the default of 1 it has no effect; values > 1 act as a secondary cap on
+  // the byte-based tile count (back-compat with explicit configs).
   //
-  // get_batch_mode: "pipeline" (default) or "mget"; see GetBatchMode.
+  // get_batch_mode: "pipeline" (default), "mget" (deprecated), or "single"
+  // (benchmark baseline); see GetBatchMode.
   // exists_batch_mode: "pipeline" (default) or "multikey"; see
   // ExistsBatchMode.
+  //
+  // get_target_tile_bytes: target payload volume per pipelined-GET tile.
+  // Tile count ~= ceil(batch_bytes / target), clamped to [1, workers]. The
+  // default of 32 MB (decimal) ~= per-TCP-flow throughput (~1.2 GB/s) x
+  // ~25 ms, which yields 1-2 keys/tile at 16-33 MB values (maximizing
+  // concurrently streaming sockets) and many keys/tile at <= 4 MB values
+  // (amortizing round trips). Must be >= 1.
   RedisConnector(std::string host, int port, int num_workers,
                  std::string username = "", std::string password = "",
-                 size_t get_min_keys_per_tile = 8,
+                 size_t get_min_keys_per_tile = 1,
                  std::string get_batch_mode = "pipeline",
-                 std::string exists_batch_mode = "pipeline");
+                 std::string exists_batch_mode = "pipeline",
+                 size_t get_target_tile_bytes = 32000000);
   ~RedisConnector() override;
+
+  // Test hook: the tile count choose_num_tiles would pick for a GET batch of
+  // num_items keys of value_bytes each. Pipeline-mode tiling is otherwise
+  // unobservable from Redis (one GET command per key regardless of tiles).
+  size_t plan_get_tiles(size_t num_items, size_t value_bytes) const {
+    return choose_num_tiles(Op::BATCH_TILE_GET, num_items, value_bytes);
+  }
 
  protected:
   WorkerConn create_connection() override;
@@ -165,9 +189,11 @@ class RedisConnector : public ConnectorBase<WorkerConn> {
   void do_batch_exists(WorkerConn& conn, const Request& req) override;
 
   // tiling policy tuned for batched commands (see connector.cpp):
-  // EXISTS -> 1 tile, GET -> get_min_keys_per_tile floor, SET/DELETE ->
-  // default fan-out.
-  size_t choose_num_tiles(Op op, size_t num_items) const override;
+  // EXISTS -> 1 tile; pipelined GET -> byte-based (get_target_tile_bytes);
+  // MGET -> get_min_keys_per_tile floor (deprecated); single GET and
+  // SET/DELETE -> default fan-out.
+  size_t choose_num_tiles(Op op, size_t num_items,
+                          size_t batch_chunk_num_bytes) const override;
 
   void shutdown_connections() override;
 
@@ -197,6 +223,7 @@ class RedisConnector : public ConnectorBase<WorkerConn> {
   size_t get_min_keys_per_tile_;
   GetBatchMode get_batch_mode_;
   ExistsBatchMode exists_batch_mode_;
+  size_t get_target_tile_bytes_;
   std::mutex worker_fds_mu_;
   std::vector<int> worker_fds_;
 };

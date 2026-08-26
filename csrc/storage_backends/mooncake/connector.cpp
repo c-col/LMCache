@@ -120,9 +120,11 @@ bool MooncakeConnector::do_single_delete(WorkerMooncakeConn& conn,
 
 void MooncakeConnector::on_workers_stopped() { unregister_all_buffers(); }
 
-size_t MooncakeConnector::choose_num_tiles(Op op, size_t num_items) const {
+size_t MooncakeConnector::choose_num_tiles(Op op, size_t num_items,
+                                           size_t batch_chunk_num_bytes) const {
   (void)op;
   (void)num_items;
+  (void)batch_chunk_num_bytes;
   // Mooncake's batch APIs already parallelize internally. Keep each LMCache
   // batch as one tile so we do not split a single backend batch across workers.
   return 1;

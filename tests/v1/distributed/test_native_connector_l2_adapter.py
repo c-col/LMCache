@@ -784,9 +784,10 @@ class TestRESPL2AdapterConfig:
         assert config.num_workers == 8
         assert config.username == ""
         assert config.password == ""
-        assert config.get_min_keys_per_tile == 8
+        assert config.get_min_keys_per_tile == 1
         assert config.get_batch_mode == "pipeline"
         assert config.exists_batch_mode == "pipeline"
+        assert config.get_target_tile_bytes == 32_000_000
 
     def test_from_dict_full(self):
         # First Party
@@ -805,6 +806,7 @@ class TestRESPL2AdapterConfig:
                 "get_min_keys_per_tile": 4,
                 "get_batch_mode": "mget",
                 "exists_batch_mode": "multikey",
+                "get_target_tile_bytes": 8_000_000,
             }
         )
         assert config.host == "10.0.0.1"
@@ -815,6 +817,40 @@ class TestRESPL2AdapterConfig:
         assert config.get_min_keys_per_tile == 4
         assert config.get_batch_mode == "mget"
         assert config.exists_batch_mode == "multikey"
+        assert config.get_target_tile_bytes == 8_000_000
+
+    def test_from_dict_single_mode_accepted(self):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.resp_l2_adapter import (
+            RESPL2AdapterConfig,
+        )
+
+        config = RESPL2AdapterConfig.from_dict(
+            {
+                "type": "resp",
+                "host": "localhost",
+                "port": 6379,
+                "get_batch_mode": "single",
+            }
+        )
+        assert config.get_batch_mode == "single"
+
+    def test_from_dict_invalid_get_target_tile_bytes_raises(self):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.resp_l2_adapter import (
+            RESPL2AdapterConfig,
+        )
+
+        for bad in (0, -1, "32mb"):
+            with pytest.raises(ValueError, match="get_target_tile_bytes"):
+                RESPL2AdapterConfig.from_dict(
+                    {
+                        "type": "resp",
+                        "host": "localhost",
+                        "port": 6379,
+                        "get_target_tile_bytes": bad,
+                    }
+                )
 
     def test_from_dict_invalid_get_min_keys_per_tile_raises(self):
         # First Party

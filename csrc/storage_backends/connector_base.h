@@ -85,8 +85,8 @@ class ConnectorBase : public IStorageConnector {
     validate_batch_inputs(keys, bufs, lens);
 
     size_t num_items = keys.size();
-    auto [batch_future_id, batch_state, num_tiles] =
-        prepare_batch_operation(num_items, Op::BATCH_TILE_GET);
+    auto [batch_future_id, batch_state, num_tiles] = prepare_batch_operation(
+        num_items, Op::BATCH_TILE_GET, batch_chunk_num_bytes);
 
     // pre-allocate per-key results for load error tolerance
     batch_state->per_key_results.assign(num_items, 0);
@@ -113,8 +113,8 @@ class ConnectorBase : public IStorageConnector {
     validate_batch_inputs(keys, bufs, lens);
 
     size_t num_items = keys.size();
-    auto [batch_future_id, batch_state, num_tiles] =
-        prepare_batch_operation(num_items, Op::BATCH_TILE_SET);
+    auto [batch_future_id, batch_state, num_tiles] = prepare_batch_operation(
+        num_items, Op::BATCH_TILE_SET, batch_chunk_num_bytes);
 
     for (size_t len : lens) {
       batch_state->total_bytes += len;
@@ -139,7 +139,8 @@ class ConnectorBase : public IStorageConnector {
 
     size_t num_items = keys.size();
     auto [batch_future_id, batch_state, num_tiles] =
-        prepare_batch_operation(num_items, Op::BATCH_TILE_EXISTS);
+        prepare_batch_operation(num_items, Op::BATCH_TILE_EXISTS,
+                                /*batch_chunk_num_bytes=*/0);
 
     // pre-allocate results vector with correct size
     batch_state->per_key_results.assign(num_items, 0);
@@ -171,7 +172,8 @@ class ConnectorBase : public IStorageConnector {
 
     size_t num_items = keys.size();
     auto [batch_future_id, batch_state, num_tiles] =
-        prepare_batch_operation(num_items, Op::BATCH_TILE_DELETE);
+        prepare_batch_operation(num_items, Op::BATCH_TILE_DELETE,
+                                /*batch_chunk_num_bytes=*/0);
 
     // pre-allocate per-key results (1 = deleted, 0 = not found)
     batch_state->per_key_results.assign(num_items, 0);
@@ -222,6 +224,18 @@ class ConnectorBase : public IStorageConnector {
     }
 
     return completions_list;
+  }
+
+  // Running per-key failure counts (see log_per_key_error). Additive API for
+  // Python-side observability; cheap enough to poll after every batch.
+  std::unordered_map<std::string, uint64_t> error_counters() const {
+    return {
+        {"get_not_found", get_not_found_.load(std::memory_order_relaxed)},
+        {"get_size_mismatch",
+         get_size_mismatch_.load(std::memory_order_relaxed)},
+        {"get_error_reply", get_error_reply_.load(std::memory_order_relaxed)},
+        {"delete_failed", delete_failed_.load(std::memory_order_relaxed)},
+    };
   }
 
   std::vector<BatchTiming> drain_batch_timings() override {
@@ -330,7 +344,12 @@ class ConnectorBase : public IStorageConnector {
     (void)key;
     return false;  // no-op default for backward compat with plugins
   }
-  virtual size_t choose_num_tiles(Op op, size_t num_items) const {
+  // batch_chunk_num_bytes is the per-key value size for GET/SET batches and 0
+  // for EXISTS/DELETE (no payloads), letting overrides size tiles by payload
+  // volume rather than key count.
+  virtual size_t choose_num_tiles(Op op, size_t num_items,
+                                  size_t batch_chunk_num_bytes) const {
+    (void)batch_chunk_num_bytes;
     return std::min<size_t>(worker_count_for_op(op), num_items);
   }
   virtual void do_batch_get(ConnectionType& conn, const Request& req) {
@@ -341,8 +360,7 @@ class ConnectorBase : public IStorageConnector {
         req.batch->per_key_results[req.start_idx + i] = 1;
       } catch (const std::exception& e) {
         req.batch->per_key_results[req.start_idx + i] = 0;
-        fprintf(stderr, "[LMCache GET] key %s failed: %s\n",
-                req.keys[i].c_str(), e.what());
+        log_per_key_error(get_error_reply_, "GET", req.keys[i], e.what());
       }
       if (i == 0) {
         // approximation: first byte ~ first key round trip finished
@@ -369,8 +387,7 @@ class ConnectorBase : public IStorageConnector {
         req.batch->per_key_results[req.start_idx + i] = deleted ? 1 : 0;
       } catch (const std::exception& e) {
         req.batch->per_key_results[req.start_idx + i] = 0;
-        fprintf(stderr, "[LMCache DELETE] key %s failed: %s\n",
-                req.keys[i].c_str(), e.what());
+        log_per_key_error(delete_failed_, "DELETE", req.keys[i], e.what());
       }
     }
   }
@@ -385,6 +402,19 @@ class ConnectorBase : public IStorageConnector {
     double expected = 0.0;
     req.batch->t_first_byte.compare_exchange_strong(expected, wall_clock_time(),
                                                     std::memory_order_relaxed);
+  }
+
+  // Per-key failures can arrive thousands at a time (e.g. a cold cache or a
+  // contaminated keyspace); log the first 5 per counter and then every
+  // 1000th, always with the running count. Counters are exposed to Python via
+  // error_counters().
+  void log_per_key_error(std::atomic<uint64_t>& counter, const char* op_name,
+                         const std::string& key, const char* what) {
+    uint64_t n = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 5 || n % 1000 == 0) {
+      fprintf(stderr, "[LMCache %s] key %s failed: %s (occurrence %llu)\n",
+              op_name, key.c_str(), what, (unsigned long long)n);
+    }
   }
 
   bool is_stopping() const { return stop_.load(std::memory_order_acquire); }
@@ -419,8 +449,9 @@ class ConnectorBase : public IStorageConnector {
 
   // returns: (batch_future_id, batch_state, num_tiles)
   std::tuple<uint64_t, std::shared_ptr<BatchState>, size_t>
-  prepare_batch_operation(size_t num_items, Op op) {
-    size_t num_tiles = choose_num_tiles(op, num_items);
+  prepare_batch_operation(size_t num_items, Op op,
+                          size_t batch_chunk_num_bytes) {
+    size_t num_tiles = choose_num_tiles(op, num_items, batch_chunk_num_bytes);
     if (num_tiles == 0 || num_tiles > num_items) {
       throw std::runtime_error(
           "choose_num_tiles must return a value in [1, num_items]");
@@ -716,6 +747,14 @@ class ConnectorBase : public IStorageConnector {
   std::atomic<bool> stop_{false};
   std::atomic<bool> closed_{false};
   std::atomic<uint64_t> next_future_id_{1};
+
+  // per-key failure counters, incremented via log_per_key_error and read via
+  // error_counters(). Backends bump the specific ones (e.g. Redis miss ->
+  // get_not_found_); the base loops bump the generic get/delete ones.
+  std::atomic<uint64_t> get_not_found_{0};
+  std::atomic<uint64_t> get_size_mismatch_{0};
+  std::atomic<uint64_t> get_error_reply_{0};
+  std::atomic<uint64_t> delete_failed_{0};
 
  private:
   std::unique_ptr<EventNotifier> notifier_;

@@ -49,21 +49,35 @@ class RESPConnectorAdapter(ConnectorAdapter):
                 "resp_mget_min_keys_per_tile was renamed to resp_get_min_keys_per_tile"
             )
 
-        # Minimum keys per batched-GET tile before the batch is split across
-        # more worker connections (default is 8; must be >= 1)
+        # DEPRECATED in favor of resp_get_target_tile_bytes. Minimum keys per
+        # batched-GET tile; values > 1 cap the byte-based tile count
+        # (default is 1 = no effect; must be >= 1)
         self.resp_get_min_keys_per_tile = int(
-            extra_config.get("resp_get_min_keys_per_tile", 8)
+            extra_config.get("resp_get_min_keys_per_tile", 1)
         )
         if self.resp_get_min_keys_per_tile < 1:
             raise ValueError("resp_get_min_keys_per_tile must be >= 1")
 
-        # How a batched-GET tile is executed: "pipeline" (default,
-        # cluster-safe) or "mget" (one multi-key command per tile)
+        # How a batched-GET tile is executed: "pipeline" (default and only
+        # supported batched mode, cluster-safe), "mget" (deprecated; one
+        # multi-key command per tile), or "single" (benchmarking baseline:
+        # one blocking round trip per key; misses desync the connection)
         self.resp_get_batch_mode = str(
             extra_config.get("resp_get_batch_mode", "pipeline")
         )
-        if self.resp_get_batch_mode not in ("pipeline", "mget"):
-            raise ValueError("resp_get_batch_mode must be 'pipeline' or 'mget'")
+        if self.resp_get_batch_mode not in ("pipeline", "mget", "single"):
+            raise ValueError(
+                "resp_get_batch_mode must be 'pipeline', 'mget', or 'single'"
+            )
+
+        # Target payload bytes per pipelined-GET tile: tile count ~=
+        # ceil(batch_bytes / target), clamped to [1, workers]
+        # (default is 32_000_000; must be >= 1)
+        self.resp_get_target_tile_bytes = int(
+            extra_config.get("resp_get_target_tile_bytes", 32_000_000)
+        )
+        if self.resp_get_target_tile_bytes < 1:
+            raise ValueError("resp_get_target_tile_bytes must be >= 1")
 
         # How a batched-EXISTS tile is executed: "pipeline" (default,
         # cluster-safe) or "multikey" (one multi-key EXISTS per tile with a
@@ -104,6 +118,7 @@ class RESPConnectorAdapter(ConnectorAdapter):
             get_min_keys_per_tile=self.resp_get_min_keys_per_tile,
             get_batch_mode=self.resp_get_batch_mode,
             exists_batch_mode=self.resp_exists_batch_mode,
+            get_target_tile_bytes=self.resp_get_target_tile_bytes,
         )
 
 

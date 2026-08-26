@@ -47,6 +47,7 @@ example usage (see `redis/pybind.cpp`):
       .def("drain_batch_timings",                                      \
            lmcache::connector::pybind_utils::bind_drain_batch_timings< \
                ConnectorType>())                                       \
+      .def("error_counters", &ConnectorType::error_counters)           \
       .def("close", &ConnectorType::close)
 
 template <typename ConnectorType>

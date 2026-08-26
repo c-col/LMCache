@@ -2,7 +2,9 @@
 
 #include "connector.h"
 #include <limits.h>
+#include <netinet/tcp.h>
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -80,6 +82,18 @@ void WorkerConn::connect(const std::string& h, int p) {
   }
 
   freeaddrinfo(result);
+
+  // 4. disable Nagle: pipelined GETs write small command batches and then
+  // wait for replies; delaying those writes costs a full RTT per tile.
+  // Non-fatal if unsupported.
+  int one = 1;
+  if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+      fprintf(stderr, "[LMCache Redis] failed to set TCP_NODELAY: %s\n",
+              strerror(errno));
+    }
+  }
 }
 
 // call send multiple times until all the data is sent
@@ -306,10 +320,22 @@ GetBatchMode parse_get_batch_mode(const std::string& mode) {
     return GetBatchMode::PIPELINE;
   }
   if (mode == "mget") {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+      fprintf(stderr,
+              "[LMCache] get_batch_mode=mget is deprecated: it measured no "
+              "faster than pipeline, monopolizes the shard event loop, and "
+              "breaks on cross-slot batches in cluster mode. Use 'pipeline' "
+              "(the default).\n");
+    }
     return GetBatchMode::MGET;
   }
+  if (mode == "single") {
+    return GetBatchMode::SINGLE;
+  }
   throw std::runtime_error(
-      "get_batch_mode must be 'pipeline' or 'mget', got '" + mode + "'");
+      "get_batch_mode must be 'pipeline', 'mget', or 'single', got '" + mode +
+      "'");
 }
 
 ExistsBatchMode parse_exists_batch_mode(const std::string& mode) {
@@ -329,7 +355,8 @@ RedisConnector::RedisConnector(std::string host, int port, int num_workers,
                                std::string username, std::string password,
                                size_t get_min_keys_per_tile,
                                std::string get_batch_mode,
-                               std::string exists_batch_mode)
+                               std::string exists_batch_mode,
+                               size_t get_target_tile_bytes)
     : ConnectorBase(num_workers),
       host_(std::move(host)),
       port_(port),
@@ -337,9 +364,13 @@ RedisConnector::RedisConnector(std::string host, int port, int num_workers,
       password_(std::move(password)),
       get_min_keys_per_tile_(get_min_keys_per_tile),
       get_batch_mode_(parse_get_batch_mode(get_batch_mode)),
-      exists_batch_mode_(parse_exists_batch_mode(exists_batch_mode)) {
+      exists_batch_mode_(parse_exists_batch_mode(exists_batch_mode)),
+      get_target_tile_bytes_(get_target_tile_bytes) {
   if (get_min_keys_per_tile_ == 0) {
     throw std::runtime_error("get_min_keys_per_tile must be >= 1");
+  }
+  if (get_target_tile_bytes_ == 0) {
+    throw std::runtime_error("get_target_tile_bytes must be >= 1");
   }
   worker_fds_.reserve(num_workers);
   start_workers();  // start after derived class is fully constructed
@@ -483,14 +514,26 @@ bool RedisConnector::do_single_delete(WorkerConn& conn,
   }
 }
 
+// There is deliberately no fallback between strategies here: a pipelined
+// tile failure propagates as a tile failure and is never re-dispatched as
+// MGET (mget is deprecated and must not be reachable implicitly).
 void RedisConnector::do_batch_get(WorkerConn& conn, const Request& req) {
   if (req.keys.empty()) {
     return;  // empty tile: nothing to send
   }
-  if (get_batch_mode_ == GetBatchMode::MGET) {
-    do_batch_get_mget(conn, req);
-  } else {
-    do_batch_get_pipelined(conn, req);
+  switch (get_batch_mode_) {
+    case GetBatchMode::MGET:
+      do_batch_get_mget(conn, req);
+      break;
+    case GetBatchMode::SINGLE:
+      // benchmark baseline: upstream LMCache's original one-blocking-round-
+      // trip-per-key loop (base class calls do_single_get per key). A miss
+      // desyncs the connection — use only against fully-hit keyspaces.
+      ConnectorBase<WorkerConn>::do_batch_get(conn, req);
+      break;
+    case GetBatchMode::PIPELINE:
+      do_batch_get_pipelined(conn, req);
+      break;
   }
 }
 
@@ -505,8 +548,7 @@ void RedisConnector::consume_bulk_value(WorkerConn& conn, const Request& req,
   if (value_len < 0) {
     // $-1\r\n: key does not exist (no payload or trailer follows)
     req.batch->per_key_results[req.start_idx + i] = 0;
-    fprintf(stderr, "[LMCache GET] key %s failed: not found\n",
-            req.keys[i].c_str());
+    log_per_key_error(get_not_found_, "GET", req.keys[i], "not found");
     return;
   }
 
@@ -519,11 +561,13 @@ void RedisConnector::consume_bulk_value(WorkerConn& conn, const Request& req,
     // later replies still parse, and fail just this key
     conn.drain_exactly(static_cast<size_t>(value_len));
     req.batch->per_key_results[req.start_idx + i] = 0;
-    fprintf(stderr,
-            "[LMCache GET] key %s failed: size mismatch (value %lld bytes, "
-            "buffer %zu bytes, chunk %zu bytes)\n",
-            req.keys[i].c_str(), static_cast<long long>(value_len),
-            req.buf_lens[i], req.batch_chunk_num_bytes);
+    char detail[128];
+    snprintf(detail, sizeof(detail),
+             "size mismatch (value %lld bytes, buffer %zu bytes, chunk %zu "
+             "bytes)",
+             static_cast<long long>(value_len), req.buf_lens[i],
+             req.batch_chunk_num_bytes);
+    log_per_key_error(get_size_mismatch_, "GET", req.keys[i], detail);
   }
 
   // payload trailer
@@ -575,8 +619,8 @@ void RedisConnector::do_batch_get_pipelined(WorkerConn& conn,
       // per-key server error; recv_line consumed the full error line, so
       // the connection stays in sync for the remaining replies
       req.batch->per_key_results[req.start_idx + i] = 0;
-      fprintf(stderr, "[LMCache GET] key %s failed: %s\n", req.keys[i].c_str(),
-              line.substr(1, line.size() - 3).c_str());
+      log_per_key_error(get_error_reply_, "GET", req.keys[i],
+                        line.substr(1, line.size() - 3).c_str());
       continue;
     }
     int64_t value_len = parse_reply_int(line, '$', "GET");
@@ -802,30 +846,50 @@ void RedisConnector::do_batch_exists_pipelined(WorkerConn& conn,
 }
 
 /*
-tiling policy for multi-key commands. the base default (one tile per worker)
-maximized parallelism when every key cost one round trip; with MGET and
-multi-key EXISTS, splitting small batches only fragments them into degenerate
-1-key commands.
+tiling policy. tile count == concurrently streaming sockets, and measured
+throughput is socket-bound (per-TCP-flow ~1.2 GB/s vs ~16-17 GB/s wire), so
+pipelined GET sizes tiles by payload volume:
 
 - EXISTS: the reply is a single integer regardless of key count, so there is
   no payload transfer to parallelize — always use 1 tile (one command).
-- GET: keep fan-out for payload-heavy batches (parallel sockets overlap
-  transfer, and one giant MGET would hold single-threaded Redis longer), but
-  require at least get_min_keys_per_tile_ keys per tile before adding more
-  connections.
+- GET (pipeline): aim for get_target_tile_bytes_ of payload per tile —
+  ceil(batch_bytes / target) tiles, clamped to [1, workers]. At 16-33 MB
+  values this streams ~1-2 keys per socket (maximizing flows); at <= 4 MB it
+  pipelines many keys per socket (amortizing round trips). An explicitly set
+  get_min_keys_per_tile_ > 1 additionally caps the fan-out (back-compat;
+  deprecated).
+- GET (mget, deprecated): the old key-count floor, unchanged.
+- GET (single): every key is its own round trip, nothing to pipeline — use
+  the default per-worker fan-out (upstream's original pattern).
 - SET / DELETE: still per-key commands, so fewer tiles would cut parallelism
   with no round-trip savings — keep the base default.
 */
-size_t RedisConnector::choose_num_tiles(Op op, size_t num_items) const {
+size_t RedisConnector::choose_num_tiles(Op op, size_t num_items,
+                                        size_t batch_chunk_num_bytes) const {
   const size_t max_tiles = std::min<size_t>(worker_count_for_op(op), num_items);
 
   switch (op) {
     case Op::BATCH_TILE_EXISTS:
       return 1;
     case Op::BATCH_TILE_GET: {
-      const size_t tiles_by_floor =
-          (num_items + get_min_keys_per_tile_ - 1) / get_min_keys_per_tile_;
-      return std::max<size_t>(1, std::min(max_tiles, tiles_by_floor));
+      if (get_batch_mode_ == GetBatchMode::SINGLE) {
+        return max_tiles;
+      }
+      if (get_batch_mode_ == GetBatchMode::MGET) {
+        const size_t tiles_by_floor =
+            (num_items + get_min_keys_per_tile_ - 1) / get_min_keys_per_tile_;
+        return std::max<size_t>(1, std::min(max_tiles, tiles_by_floor));
+      }
+      const size_t batch_bytes = num_items * batch_chunk_num_bytes;
+      size_t tiles = std::max<size_t>(
+          1, std::min(max_tiles, (batch_bytes + get_target_tile_bytes_ - 1) /
+                                     get_target_tile_bytes_));
+      if (get_min_keys_per_tile_ > 1) {
+        const size_t tiles_by_floor =
+            (num_items + get_min_keys_per_tile_ - 1) / get_min_keys_per_tile_;
+        tiles = std::min(tiles, std::max<size_t>(1, tiles_by_floor));
+      }
+      return tiles;
     }
     default:
       return max_tiles;

@@ -311,9 +311,10 @@ class MockRESPClient:
         loop=None,
         username: str = "",
         password: str = "",
-        get_min_keys_per_tile: int = 8,
+        get_min_keys_per_tile: int = 1,
         get_batch_mode: str = "pipeline",
         exists_batch_mode: str = "pipeline",
+        get_target_tile_bytes: int = 32_000_000,
     ):
         self._store: dict[str, bytes] = {}  # key -> bytes
         self._loop = loop
@@ -323,6 +324,7 @@ class MockRESPClient:
         self._get_min_keys_per_tile = get_min_keys_per_tile
         self._get_batch_mode = get_batch_mode
         self._exists_batch_mode = exists_batch_mode
+        self._get_target_tile_bytes = get_target_tile_bytes
 
     async def exists(self, key: str) -> bool:
         return key in self._store

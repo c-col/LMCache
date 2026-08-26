@@ -63,7 +63,8 @@ class MooncakeConnector : public ConnectorBase<WorkerMooncakeConn> {
 
   void on_workers_stopped() override;
 
-  size_t choose_num_tiles(Op op, size_t num_items) const override;
+  size_t choose_num_tiles(Op op, size_t num_items,
+                          size_t batch_chunk_num_bytes) const override;
 
   void do_batch_get(WorkerMooncakeConn& conn, const Request& req) override;
 

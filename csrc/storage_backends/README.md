@@ -152,12 +152,13 @@ What `ConnectorBase` gives you for free:
 
 #### Tiling: how batches are split across workers
 
-A batch of N keys is split into `choose_num_tiles(op, N)` tiles (default:
-`min(num_workers, N)`), each executed by one worker thread on its own
-connection. Tiles are **balanced**: every tile gets `floor(N / num_tiles)`
-keys and the first `N mod num_tiles` tiles get one extra, so no tile is ever
-empty and no degenerate 1-key remainder tiles are produced (13 keys over 5
-tiles → 3,3,3,2,2).
+A batch of N keys is split into `choose_num_tiles(op, N, chunk_bytes)` tiles
+(default: `min(num_workers, N)`; `chunk_bytes` is the per-key value size for
+GET/SET and 0 for EXISTS/DELETE), each executed by one worker thread on its
+own connection. Tiles are **balanced**: every tile gets `floor(N /
+num_tiles)` keys and the first `N mod num_tiles` tiles get one extra, so no
+tile is ever empty and no degenerate 1-key remainder tiles are produced (13
+keys over 5 tiles → 3,3,3,2,2).
 
 Override `choose_num_tiles` to tune the fan-out per operation. The tradeoff
 only matters for backends with native multi-key commands: fewer tiles →
@@ -178,30 +179,44 @@ implementations:
   `choose_num_tiles` to return 1 since the library parallelizes internally.
 - **Redis** (`redis/connector.cpp`): implements the batching at the RESP
   protocol level with a per-op tiling policy (`choose_num_tiles`): EXISTS
-  always uses 1 tile (replies are tiny — nothing to parallelize), GET
-  requires at least `get_min_keys_per_tile` keys per tile before fanning out
-  to more connections (constructor arg, default 8, applies to both GET
-  modes; exposed as `resp_get_min_keys_per_tile` in non-MP `extra_config`
-  and `get_min_keys_per_tile` in the MP `resp` L2 adapter config), and
-  SET/DELETE keep the default fan-out:
-  - `do_batch_get` executes each tile in one round trip using one of two
-    wire strategies selected by `get_batch_mode` (constructor arg; exposed
-    as `resp_get_batch_mode` in non-MP `extra_config` and `get_batch_mode`
-    in the MP `resp` L2 adapter config):
+  always uses 1 tile (replies are tiny — nothing to parallelize), pipelined
+  GET sizes tiles by payload volume — `ceil(batch_bytes /
+  get_target_tile_bytes)` tiles clamped to `[1, workers]` (constructor arg,
+  default 32 MB decimal; exposed as `resp_get_target_tile_bytes` in non-MP
+  `extra_config` and `get_target_tile_bytes` in the MP `resp` L2 adapter
+  config) — and SET/DELETE keep the default fan-out. The older
+  `get_min_keys_per_tile` key-count floor (constructor arg; exposed as
+  `resp_get_min_keys_per_tile` / `get_min_keys_per_tile`) is deprecated: it
+  defaults to 1 (no effect); values > 1 act as a secondary cap on the
+  byte-based tile count for back-compat, and it still governs the deprecated
+  mget mode's tiling.
+  - `do_batch_get` executes each tile using one of three wire strategies
+    selected by `get_batch_mode` (constructor arg; exposed as
+    `resp_get_batch_mode` in non-MP `extra_config` and `get_batch_mode`
+    in the MP `resp` L2 adapter config). `"pipeline"` is the only supported
+    batched mode; there is no fallback between strategies (a pipelined tile
+    failure is never re-dispatched as mget):
     - `"pipeline"` (default): N single-key `GET` commands written in one
       batch, then N replies. Each command executes and is routed
       independently — cross-slot batches work on Redis Cluster, the server
       can interleave other clients between keys, and per-key error replies
       (e.g. `WRONGTYPE`) fail only that key.
-    - `"mget"`: one `MGET k1 .. kN` per tile. Slightly fewer reply bytes,
-      but the command executes atomically (holding the single-threaded
-      event loop for the whole tile) and cross-slot batches fail on Redis
-      Cluster.
-    In both modes misses (`$-1` nil replies) and size-mismatched values are
-    tolerated per key: the unusable payload is drained so the connection
-    stays in protocol sync, only that key's result is marked failed. (The
-    single-key `do_single_get` cannot recover this way — a miss desyncs its
-    connection — so the batch paths are both faster and more robust.)
+    - `"mget"` (DEPRECATED — selecting it warns once): one `MGET k1 .. kN`
+      per tile. Measured no faster than pipeline anywhere, executes
+      atomically (holding the single-threaded event loop for the whole
+      tile), serializes at the Redis Enterprise proxy, and cross-slot
+      batches fail on Redis Cluster.
+    - `"single"` (benchmarking baseline only): one blocking GET round trip
+      per key via the base-class loop — upstream LMCache's original
+      behavior, including its limitation that a miss desyncs the
+      connection. Use only against fully-hit keyspaces, to A/B original vs
+      pipelined GET in one binary.
+    In the pipeline and mget modes misses (`$-1` nil replies) and
+    size-mismatched values are tolerated per key: the unusable payload is
+    drained so the connection stays in protocol sync, only that key's
+    result is marked failed. (The single-key `do_single_get` cannot recover
+    this way — a miss desyncs its connection — so the batch paths are both
+    faster and more robust.)
   - `do_batch_set` pipelines a whole tile: one scatter-gather write of N
     `SET` commands (payloads referenced zero-copy via iovec), then N status
     replies — one round trip per tile instead of N. On an error reply the
@@ -231,9 +246,10 @@ throwing.
 
 ### Step 2: Pybind module
 
-Use the `LMCACHE_BIND_CONNECTOR_METHODS` macro which binds all 6 methods
-(`event_fd`, `submit_batch_get/set/exists`, `drain_completions`, `close`)
-with proper GIL release and buffer protocol handling.
+Use the `LMCACHE_BIND_CONNECTOR_METHODS` macro which binds the shared
+connector surface (`event_fd`, `submit_batch_get/set/exists/delete`,
+`drain_completions`, `drain_batch_timings`, `error_counters`, `close`) with
+proper GIL release and buffer protocol handling.
 
 ```cpp
 // csrc/storage_backends/mybackend/pybind.cpp

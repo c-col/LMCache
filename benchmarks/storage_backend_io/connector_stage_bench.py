@@ -67,6 +67,7 @@ class SyncTimedClient:
             args.get_min_keys_per_tile,
             args.get_batch_mode,
             "pipeline",
+            int(args.get_target_tile_mb * 1000 * 1000),
         )
         self.poll = select.poll()
         self.poll.register(self.client.event_fd(), select.POLLIN)
@@ -193,7 +194,8 @@ def run_sweep_point(
             f"\n== op={op} workers={num_workers} keys={num_keys} "
             f"value={value_bytes / 1e6:.2f}MB batch={total_gb:.3f}GB "
             f"mode={args.get_batch_mode} min_keys_per_tile="
-            f"{args.get_min_keys_per_tile} inflight={inflight}"
+            f"{args.get_min_keys_per_tile} target_tile_mb="
+            f"{args.get_target_tile_mb:g} inflight={inflight}"
         )
 
         wall_start = time.perf_counter()
@@ -316,9 +318,25 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--op", choices=["get", "set"], default="get")
     parser.add_argument(
-        "--get-batch-mode", choices=["pipeline", "mget"], default="pipeline"
+        "--get-batch-mode",
+        choices=["pipeline", "mget", "single"],
+        default="pipeline",
+        help="'pipeline' (default), 'mget' (deprecated), or 'single' "
+        "(upstream per-key round-trip baseline; fully-hit keyspaces only)",
     )
-    parser.add_argument("--get-min-keys-per-tile", type=int, default=8)
+    parser.add_argument(
+        "--get-min-keys-per-tile",
+        type=int,
+        default=1,
+        help="deprecated in favor of --get-target-tile-mb; values >1 cap "
+        "the byte-based tile count",
+    )
+    parser.add_argument(
+        "--get-target-tile-mb",
+        type=float,
+        default=32,
+        help="target payload MB (decimal) per pipelined-GET tile",
+    )
     parser.add_argument(
         "--no-cleanup",
         dest="cleanup",

@@ -49,9 +49,10 @@ class RESPConnector(RemoteConnector):
         num_threads: int = 8,
         username: str = "",
         password: str = "",
-        get_min_keys_per_tile: int = 8,
+        get_min_keys_per_tile: int = 1,
         get_batch_mode: str = "pipeline",
         exists_batch_mode: str = "pipeline",
+        get_target_tile_bytes: int = 32_000_000,
     ):
         # this gives us access to self.full_chunk_size_bytes
         super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
@@ -72,6 +73,7 @@ class RESPConnector(RemoteConnector):
             get_min_keys_per_tile,
             get_batch_mode,
             exists_batch_mode,
+            get_target_tile_bytes,
         )
         self.pq_executor = AsyncPQExecutor(loop)
 
