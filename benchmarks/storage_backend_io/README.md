@@ -1,5 +1,31 @@
 # Storage Backend I/O Benchmark
 
+This directory holds two microbenchmarks.
+
+## connector_stage_bench.py — native connector stage timing
+
+Drives the raw pybind Redis client (`lmcache.lmcache_redis.LMCacheRedisClient`)
+directly — no LMCache Python layers, no MP server — and reads the connector's
+per-batch stage timestamps via `drain_batch_timings()`: queue (submit → first
+worker dequeue), dispatch (dequeue → first reply byte), transfer (first byte →
+last tile done), handoff (done → drained by Python), total, plus GB/s. Use it
+to decide whether a serving-stack throughput ceiling lives in the connector /
+wire / Redis (this benchmark plateaus at the same rate) or above the connector
+in staging / MP transfer / KV injection (this benchmark goes much faster).
+
+```bash
+python benchmarks/storage_backend_io/connector_stage_bench.py \
+  --host <redis-host> --port 6379 \
+  --num-workers 8,16,32,64 --num-keys 125 --value-mb 16.8 \
+  --batches 8 --warmup 2 --op get
+```
+
+`--num-workers`, `--num-keys`, and `--value-mb` accept comma-separated sweep
+lists; every sweep point prints per-batch stage lines, mean/p50/p99 per stage,
+and a `CSV,`-prefixed summary row for easy collection.
+
+## storage_backend_io_benchmark.py — backend write/read concurrency
+
 This microbenchmark compares multiple storage backends under high write/read concurrency:
 - **LocalDiskBackend** - Local disk with optional O_DIRECT
 - **RustRawBlockBackend** - Raw block device with optional O_DIRECT and io_uring

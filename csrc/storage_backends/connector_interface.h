@@ -111,6 +111,25 @@ class IStorageConnector {
   virtual std::vector<Completion> drain_completions() = 0;
 
   /*
+  drain all available per-batch stage-timing records
+
+  each record corresponds to one drained Completion (matched by future_id) and
+  carries the connector-side stage timestamps (submit, first dequeue, first
+  byte, last tile done) plus op/num_keys/total_bytes. A timing record is
+  enqueued in the same critical section as its Completion, so calling
+  drain_completions() and then drain_batch_timings() always observes a timing
+  for every completion just drained.
+
+  non-pure with an empty default so external connectors implementing this
+  interface directly keep compiling; ConnectorBase provides the real
+  implementation for all built-in backends.
+
+  returns:
+    std::vector<BatchTiming>: all timing records ready since last drain
+  */
+  virtual std::vector<BatchTiming> drain_batch_timings() { return {}; }
+
+  /*
   shutdown the connector and cleanup resources
 
   this method:

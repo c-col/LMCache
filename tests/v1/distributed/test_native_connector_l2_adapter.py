@@ -1425,3 +1425,137 @@ class TestUsageTracking:
         usage = adp.get_usage()
         assert usage.usage_fraction == pytest.approx(0.2)
         assert usage.total_bytes_used == 400
+
+
+# =============================================================================
+# Connector Batch Timing Tests (optional drain_batch_timings API)
+# =============================================================================
+
+
+class MockNativeConnectorWithTimings(MockNativeConnector):
+    """Mock that also exposes the optional ``drain_batch_timings()`` API.
+
+    Mirrors the C++ contract: one timing record per completion, enqueued
+    together with it, so a drain_completions() -> drain_batch_timings()
+    sequence always finds a timing for every completion just drained.
+    """
+
+    _T0 = 1_700_000_000.0
+
+    def __init__(self):
+        super().__init__()
+        self._timings: list[tuple] = []
+
+    def _push_completion(
+        self, fid: int, ok: bool, error: str, result_bools: list[bool] | None
+    ):
+        with self._lock:
+            self._timings.append(
+                (
+                    fid,
+                    "get",
+                    2,
+                    2048,
+                    self._T0,
+                    self._T0 + 0.001,
+                    self._T0 + 0.002,
+                    self._T0 + 0.010,
+                )
+            )
+        super()._push_completion(fid, ok, error, result_bools)
+
+    def drain_batch_timings(self) -> list[tuple]:
+        with self._lock:
+            timings = list(self._timings)
+            self._timings.clear()
+        return timings
+
+
+class _RecordingEventBus:
+    """Captures published events; signals after each publish."""
+
+    def __init__(self):
+        self.events: list = []
+        self.published = threading.Event()
+
+    def has_subscribers(self, event_type) -> bool:
+        return True
+
+    def publish(self, event) -> None:
+        self.events.append(event)
+        self.published.set()
+
+
+class TestConnectorBatchTimings:
+    def test_client_without_timings_api_is_tolerated(self):
+        """The default mock has no drain_batch_timings; the getattr guard
+        must leave the adapter fully functional."""
+        mock_client = MockNativeConnector()
+        adp = NativeConnectorL2Adapter(mock_client)
+        try:
+            assert adp._drain_batch_timings is None
+            store_fd = adp.get_store_event_fd()
+            adp.submit_store_task([create_object_key(1)], [create_memory_obj()])
+            assert wait_for_event_fd(store_fd, timeout=5.0)
+            completed = adp.pop_completed_store_tasks()
+            assert len(completed) == 1
+        finally:
+            adp.close()
+
+    def test_timings_published_to_event_bus(self):
+        # First Party
+        from lmcache.v1.mp_observability.event import EventType
+
+        mock_client = MockNativeConnectorWithTimings()
+        adp = NativeConnectorL2Adapter(mock_client)
+        bus = _RecordingEventBus()
+        # Swap the bus BEFORE submitting: the mock completes synchronously
+        # and the demux thread publishes immediately after draining.
+        adp._event_bus = bus
+        try:
+            store_fd = adp.get_store_event_fd()
+            adp.submit_store_task([create_object_key(1)], [create_memory_obj()])
+            assert wait_for_event_fd(store_fd, timeout=5.0)
+            assert bus.published.wait(timeout=5.0)
+
+            timing_events = [
+                e
+                for e in bus.events
+                if e.event_type == EventType.L2_CONNECTOR_BATCH_TIMING
+            ]
+            assert len(timing_events) == 1
+            md = timing_events[0].metadata
+            assert md["op"] == "get"
+            assert md["num_keys"] == 2
+            assert md["total_bytes"] == 2048
+            assert md["t_submit"] == MockNativeConnectorWithTimings._T0
+            assert md["t_first_dequeue"] > md["t_submit"]
+            assert md["t_first_byte"] > md["t_first_dequeue"]
+            assert md["t_last_done"] > md["t_first_byte"]
+            # t_consumed is stamped by the demux thread with time.time()
+            assert md["t_consumed"] > 0
+            # backend falls back to the client class name when
+            # set_backend_identity() has not run
+            assert md["backend"] == "MockNativeConnectorWithTimings"
+        finally:
+            adp.close()
+
+    def test_timings_drain_failure_disables_api(self):
+        """A raising drain_batch_timings must be disabled, not crash the
+        demux thread."""
+        mock_client = MockNativeConnectorWithTimings()
+
+        def _boom():
+            raise RuntimeError("broken timings")
+
+        mock_client.drain_batch_timings = _boom
+        adp = NativeConnectorL2Adapter(mock_client)
+        try:
+            store_fd = adp.get_store_event_fd()
+            adp.submit_store_task([create_object_key(1)], [create_memory_obj()])
+            assert wait_for_event_fd(store_fd, timeout=5.0)
+            completed = adp.pop_completed_store_tasks()
+            assert len(completed) == 1
+            assert adp._drain_batch_timings is None
+        finally:
+            adp.close()

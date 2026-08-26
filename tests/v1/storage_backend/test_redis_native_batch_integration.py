@@ -24,6 +24,7 @@ Requires a running Redis server and the C++ extension. Skipped otherwise.
 import os
 import select
 import subprocess
+import time
 import uuid
 
 # Third Party
@@ -113,6 +114,9 @@ class _SyncClient:
         self.poll = select.poll()
         self.poll.register(self.client.event_fd(), select.POLLIN)
         self.pending: dict[int, tuple[bool, str, list[bool]]] = {}
+        # future_id -> (op, num_keys, total_bytes, t_submit, t_first_dequeue,
+        #               t_first_byte, t_last_done, t_consumed)
+        self.timings: dict[int, tuple] = {}
 
     def _wait(self, future_id: int, timeout_s: float = 10.0):
         if future_id in self.pending:
@@ -121,7 +125,13 @@ class _SyncClient:
             events = self.poll.poll(timeout_s * 1000)
             if not events:
                 raise TimeoutError(f"future {future_id} never completed")
-            for fid, ok, err, bools in self.client.drain_completions():
+            completions = self.client.drain_completions()
+            # timings are co-enqueued with their completion, so draining
+            # right after drain_completions() must find one per completion
+            t_consumed = time.time()
+            for tfid, op, nk, nb, t0, t1, t2, t3 in self.client.drain_batch_timings():
+                self.timings[tfid] = (op, nk, nb, t0, t1, t2, t3, t_consumed)
+            for fid, ok, err, bools in completions:
                 self.pending[fid] = (ok, err, bools)
             if future_id in self.pending:
                 return self.pending.pop(future_id)
@@ -139,6 +149,26 @@ class _SyncClient:
 
     def batch_delete(self, keys: list[str]):
         return self._wait(self.client.submit_batch_delete(keys))
+
+    def batch_set_timed(self, keys: list[str], payloads: list[bytearray]):
+        """Like batch_set, but also returns the batch's timing record."""
+        views = [memoryview(p) for p in payloads]
+        fid = self.client.submit_batch_set(keys, views)
+        result = self._wait(fid)
+        return result, self.timings.pop(fid, None)
+
+    def batch_get_timed(self, keys: list[str], bufs: list[bytearray]):
+        """Like batch_get, but also returns the batch's timing record."""
+        views = [memoryview(b) for b in bufs]
+        fid = self.client.submit_batch_get(keys, views)
+        result = self._wait(fid)
+        return result, self.timings.pop(fid, None)
+
+    def batch_exists_timed(self, keys: list[str]):
+        """Like batch_exists, but also returns the batch's timing record."""
+        fid = self.client.submit_batch_exists(keys)
+        result = self._wait(fid)
+        return result, self.timings.pop(fid, None)
 
     def close(self):
         self.client.close()
@@ -632,3 +662,71 @@ class TestTilingPolicy:
         finally:
             client.batch_delete(keys)
             client.close()
+
+
+class TestBatchTimings:
+    """drain_batch_timings(): one record per batch with monotonic,
+    wall-clock-aligned stage timestamps."""
+
+    def test_get_timing_monotonic_and_matches(self, client, stored_keys, prefix):
+        keys, payloads = stored_keys
+        bufs = [bytearray(CHUNK_SIZE) for _ in keys]
+
+        t0 = time.time() - 0.5
+        (ok, err, bools), timing = client.batch_get_timed(keys, bufs)
+        t1 = time.time() + 0.5
+        assert ok, err
+
+        assert timing is not None, "no timing record for GET batch"
+        (op, num_keys, total_bytes, t_submit, t_dequeue, t_first_byte,
+         t_last_done, t_consumed) = timing
+        assert op == "get"
+        assert num_keys == len(keys)
+        assert total_bytes == len(keys) * CHUNK_SIZE
+        # monotonic within the connector's anchored clock
+        assert t_submit <= t_dequeue <= t_last_done
+        # GET reports a first byte between dequeue and completion
+        assert t_first_byte > 0.0
+        assert t_dequeue <= t_first_byte <= t_last_done
+        # aligned with Python time.time()
+        for ts in (t_submit, t_dequeue, t_first_byte, t_last_done):
+            assert t0 <= ts <= t1
+        assert t_consumed >= t0
+
+    def test_set_timing_has_no_first_byte(self, client, prefix):
+        keys = [f"{prefix}:timed{i}" for i in range(4)]
+        payloads = [_make_payload(i, CHUNK_SIZE) for i in range(4)]
+        try:
+            (ok, err, _), timing = client.batch_set_timed(keys, payloads)
+            assert ok, err
+            assert timing is not None, "no timing record for SET batch"
+            (op, num_keys, total_bytes, t_submit, t_dequeue, t_first_byte,
+             t_last_done, _) = timing
+            assert op == "set"
+            assert num_keys == 4
+            assert total_bytes == 4 * CHUNK_SIZE
+            assert t_submit <= t_dequeue <= t_last_done
+            # SET does not report a first byte (v1: GET only)
+            assert t_first_byte == 0.0
+        finally:
+            client.batch_delete(keys)
+
+    def test_exists_timing_zero_bytes(self, client, stored_keys):
+        keys, _ = stored_keys
+        (ok, err, bools), timing = client.batch_exists_timed(keys)
+        assert ok, err
+        assert timing is not None, "no timing record for EXISTS batch"
+        op, num_keys, total_bytes, t_submit, t_dequeue, _, t_last_done, _ = timing
+        assert op == "exists"
+        assert num_keys == len(keys)
+        assert total_bytes == 0
+        assert t_submit <= t_dequeue <= t_last_done
+
+    def test_second_drain_returns_empty(self, client, stored_keys):
+        keys, _ = stored_keys
+        (ok, err, _), timing = client.batch_exists_timed(keys)
+        assert ok, err
+        assert timing is not None
+        # every record was already drained by _wait
+        assert client.client.drain_batch_timings() == []
+        assert client.timings == {}

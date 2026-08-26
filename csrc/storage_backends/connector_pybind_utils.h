@@ -44,6 +44,9 @@ example usage (see `redis/pybind.cpp`):
       .def("drain_completions",                                        \
            lmcache::connector::pybind_utils::bind_drain_completions<   \
                ConnectorType>())                                       \
+      .def("drain_batch_timings",                                      \
+           lmcache::connector::pybind_utils::bind_drain_batch_timings< \
+               ConnectorType>())                                       \
       .def("close", &ConnectorType::close)
 
 template <typename ConnectorType>
@@ -156,6 +159,46 @@ auto bind_drain_completions() {
     return result;
   };
 }
+inline const char* op_name(Op op) {
+  switch (op) {
+    case Op::BATCH_TILE_GET:
+      return "get";
+    case Op::BATCH_TILE_SET:
+      return "set";
+    case Op::BATCH_TILE_EXISTS:
+      return "exists";
+    case Op::BATCH_TILE_DELETE:
+      return "delete";
+  }
+  return "unknown";
+}
+
+template <typename ConnectorType>
+auto bind_drain_batch_timings() {
+  return [](ConnectorType& self) {
+    // call cpp method without holding GIL
+    std::vector<BatchTiming> timings;
+    {
+      py::gil_scoped_release release;
+      timings = self.drain_batch_timings();
+    }
+
+    // convert to python objects (requires GIL). tuple shape:
+    // (future_id, op, num_keys, total_bytes,
+    //  t_submit, t_first_dequeue, t_first_byte, t_last_done)
+    // timestamps are epoch seconds comparable to time.time();
+    // t_first_byte is 0.0 when the backend never reported it.
+    py::list result;
+    for (auto& t : timings) {
+      result.append(py::make_tuple(t.future_id, op_name(t.op), t.num_keys,
+                                   t.total_bytes, t.t_submit, t.t_first_dequeue,
+                                   t.t_first_byte, t.t_last_done));
+    }
+
+    return result;
+  };
+}
+
 inline WorkerPoolConfig parse_per_op_workers(const py::object& obj) {
   if (obj.is_none()) {
     return {};

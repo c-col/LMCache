@@ -53,6 +53,16 @@ class EventType(Enum):
     L2_LOAD_TASK_SUBMITTED = "l2.load_task.submitted"
     L2_LOAD_TASK_COMPLETED = "l2.load_task.completed"
 
+    # Per-batch connector stage timing, published by the native connector
+    # L2 adapter's demux thread from the native client's
+    # drain_batch_timings().  Metadata: op (str: get/set/exists/delete),
+    # num_keys (int), total_bytes (int), t_submit, t_first_dequeue,
+    # t_first_byte (0.0 = backend never reported it), t_last_done,
+    # t_consumed, backend (str).  All t_* values are epoch seconds
+    # comparable to time.time(); they ride in metadata because publish()
+    # overwrites Event.timestamp.
+    L2_CONNECTOR_BATCH_TIMING = "l2.connector.batch_timing"
+
     # L2 Eviction Controller events
     L2_KEYS_EVICTED = "l2.keys.evicted"
 

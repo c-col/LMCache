@@ -25,6 +25,7 @@ from collections import defaultdict
 from typing import Any
 import select
 import threading
+import time
 
 # First Party
 from lmcache.lmcache_native import Bitmap
@@ -36,6 +37,7 @@ from lmcache.v1.distributed.l2_adapters.base import (
     L2TaskId,
 )
 from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.platform import create_event_notifier
 
 logger = init_logger(__name__)
@@ -94,6 +96,14 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
       - drain_completions()
           -> list[tuple[int, bool, str, list[bool]|None]]
       - close()
+
+    Optionally (detected via getattr; absent on older clients and mocks):
+      - drain_batch_timings() -> list[tuple[int, str, int, int,
+          float, float, float, float]]
+          per-batch connector stage timestamps
+          (future_id, op, num_keys, total_bytes,
+           t_submit, t_first_dequeue, t_first_byte, t_last_done);
+          published as L2_CONNECTOR_BATCH_TIMING events by the demux thread.
     """
 
     # Operation type tags for the pending-ops map
@@ -140,6 +150,10 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
         # Delete capability detection
         self._has_delete = callable(getattr(native_client, "submit_batch_delete", None))
+
+        # Optional connector stage-timing API (absent on older native
+        # clients, plugins, and test mocks). Set to None on first failure.
+        self._drain_batch_timings = getattr(native_client, "drain_batch_timings", None)
 
         # Pending delete events for synchronous delete() calls
         self._pending_delete_events: dict[L2TaskId, threading.Event] = {}
@@ -411,6 +425,21 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             if not completions:
                 continue
 
+            # Connector stage-timing records (optional native-client API).
+            # Drained AFTER drain_completions(): the connector enqueues each
+            # record in the same critical section as its completion, so every
+            # completion drained above already has its timing available here.
+            # t_consumed is this thread's drain moment — the "consumed by
+            # Python" stage boundary.
+            t_consumed = time.time()
+            timings: list[Any] = []
+            if self._drain_batch_timings is not None:
+                try:
+                    timings = self._drain_batch_timings()
+                except Exception:
+                    logger.exception("drain_batch_timings failed; disabling it")
+                    self._drain_batch_timings = None
+
             # Collect listener notifications to fire after
             # releasing the lock. Sizes are collected in parallel so
             # ``_notify_keys_*`` can update the base class's byte
@@ -534,3 +563,37 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             # returning and the notify running.
             for evt in delete_done_events:
                 evt.set()
+
+            # Publish connector stage timings outside the lock. Timestamps
+            # ride in metadata because EventBus.publish() overwrites
+            # Event.timestamp with its own time.time().
+            if timings and self._event_bus.has_subscribers(
+                EventType.L2_CONNECTOR_BATCH_TIMING
+            ):
+                backend = self._backend_name or self._type_name
+                for (
+                    _future_id,
+                    op,
+                    num_keys,
+                    total_bytes,
+                    t_submit,
+                    t_first_dequeue,
+                    t_first_byte,
+                    t_last_done,
+                ) in timings:
+                    self._event_bus.publish(
+                        Event(
+                            event_type=EventType.L2_CONNECTOR_BATCH_TIMING,
+                            metadata={
+                                "op": str(op),
+                                "num_keys": int(num_keys),
+                                "total_bytes": int(total_bytes),
+                                "t_submit": t_submit,
+                                "t_first_dequeue": t_first_dequeue,
+                                "t_first_byte": t_first_byte,
+                                "t_last_done": t_last_done,
+                                "t_consumed": t_consumed,
+                                "backend": backend,
+                            },
+                        )
+                    )

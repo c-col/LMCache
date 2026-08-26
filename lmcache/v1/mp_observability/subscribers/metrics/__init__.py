@@ -27,6 +27,9 @@ from lmcache.v1.mp_observability.subscribers.metrics.l1_lifecycle import (
     L1LifecycleSubscriber,
 )
 from lmcache.v1.mp_observability.subscribers.metrics.l2 import L2MetricsSubscriber
+from lmcache.v1.mp_observability.subscribers.metrics.l2_connector_stages import (
+    L2ConnectorStageMetricsSubscriber,
+)
 from lmcache.v1.mp_observability.subscribers.metrics.l2_failures import (
     L2FailureMetricsSubscriber,
 )
@@ -53,6 +56,7 @@ __all__ = [
     "L1FailureMetricsSubscriber",
     "L1LifecycleSubscriber",
     "L1MetricsSubscriber",
+    "L2ConnectorStageMetricsSubscriber",
     "L2FailureMetricsSubscriber",
     "L2MetricsSubscriber",
     "L2ThroughputSubscriber",

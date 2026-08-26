@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "connector_clock.h"
 #include "connector_interface.h"
 #include "connector_types.h"
 #include "event_notifier.h"
@@ -89,6 +90,9 @@ class ConnectorBase : public IStorageConnector {
 
     // pre-allocate per-key results for load error tolerance
     batch_state->per_key_results.assign(num_items, 0);
+    for (size_t len : lens) {
+      batch_state->total_bytes += len;
+    }
 
     // fan out work to threads
     for (size_t tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
@@ -111,6 +115,10 @@ class ConnectorBase : public IStorageConnector {
     size_t num_items = keys.size();
     auto [batch_future_id, batch_state, num_tiles] =
         prepare_batch_operation(num_items, Op::BATCH_TILE_SET);
+
+    for (size_t len : lens) {
+      batch_state->total_bytes += len;
+    }
 
     // fan out work to threads
     for (size_t tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
@@ -216,6 +224,17 @@ class ConnectorBase : public IStorageConnector {
     return completions_list;
   }
 
+  std::vector<BatchTiming> drain_batch_timings() override {
+    // No eventfd interaction: timing records piggyback on the completion
+    // signal. Call after drain_completions(); each record was enqueued in the
+    // same comp_mu_ critical section as its Completion, so every completion
+    // just drained has its timing record available here.
+    std::lock_guard<std::mutex> lk(comp_mu_);
+    std::vector<BatchTiming> out;
+    out.swap(batch_timings_);
+    return out;
+  }
+
   void close() override {
     if (closed_.exchange(true, std::memory_order_acq_rel)) {
       return;  // Already closed
@@ -264,6 +283,7 @@ class ConnectorBase : public IStorageConnector {
       while (!completions_.empty()) {
         completions_.pop();
       }
+      batch_timings_.clear();
     }
   }
 
@@ -324,6 +344,10 @@ class ConnectorBase : public IStorageConnector {
         fprintf(stderr, "[LMCache GET] key %s failed: %s\n",
                 req.keys[i].c_str(), e.what());
       }
+      if (i == 0) {
+        // approximation: first byte ~ first key round trip finished
+        note_first_byte(req);
+      }
     }
   }
   virtual void do_batch_set(ConnectionType& conn, const Request& req) {
@@ -352,6 +376,16 @@ class ConnectorBase : public IStorageConnector {
   }
   virtual void shutdown_connections() {}
   virtual void on_workers_stopped() {}
+
+  // Record the batch's first-byte timestamp (first-writer-wins across tiles).
+  // Backends call this when the first reply bytes for a tile arrive; the base
+  // do_batch_get loop calls it after the first single-key GET as an
+  // approximation for backends without a finer hook.
+  void note_first_byte(const Request& req) {
+    double expected = 0.0;
+    req.batch->t_first_byte.compare_exchange_strong(expected, wall_clock_time(),
+                                                    std::memory_order_relaxed);
+  }
 
   bool is_stopping() const { return stop_.load(std::memory_order_acquire); }
 
@@ -398,6 +432,8 @@ class ConnectorBase : public IStorageConnector {
     auto batch_state = std::make_shared<BatchState>();
     batch_state->remaining_tiles.store(num_tiles, std::memory_order_relaxed);
     batch_state->batch_op = op;
+    batch_state->t_submit = wall_clock_time();
+    batch_state->num_keys = num_items;
 
     return {batch_future_id, batch_state, num_tiles};
   }
@@ -460,10 +496,25 @@ class ConnectorBase : public IStorageConnector {
     req_cv_.notify_one();
   }
 
-  void push_completion(Completion&& c) {
+  void push_completion(Completion&& c, BatchTiming&& timing) {
     {
+      // completion and its timing record are enqueued in ONE critical
+      // section, so a drain_completions() -> drain_batch_timings() sequence
+      // always finds a timing for every completion it just drained
       std::lock_guard<std::mutex> lk(comp_mu_);
       completions_.push(std::move(c));
+      if (batch_timings_.size() < kMaxPendingTimings) {
+        batch_timings_.push_back(std::move(timing));
+      } else {
+        if (dropped_timings_ == 0) {
+          fprintf(stderr,
+                  "[LMCache Connector] batch timing buffer full (%zu); "
+                  "dropping records (is drain_batch_timings() being "
+                  "called?)\n",
+                  kMaxPendingTimings);
+        }
+        ++dropped_timings_;
+      }
     }
     signal_eventfd_();
   }
@@ -556,6 +607,13 @@ class ConnectorBase : public IStorageConnector {
           requests.pop();
         }
 
+        // first tile of the batch to be picked up wins the CAS
+        {
+          double expected = 0.0;
+          req.batch->t_first_dequeue.compare_exchange_strong(
+              expected, wall_clock_time(), std::memory_order_relaxed);
+        }
+
         Completion comp;
         comp.future_id = req.future_id;
 
@@ -611,12 +669,16 @@ class ConnectorBase : public IStorageConnector {
       }
     }
 
-    // check if this is the last tile to complete
+    // check if this is the last tile to complete. acq_rel (not relaxed) so
+    // the last tile's reads of per_key_results and the timing stamps written
+    // by other tiles are formally ordered behind their fetch_subs.
     uint32_t tiles_left =
-        req.batch->remaining_tiles.fetch_sub(1, std::memory_order_relaxed) - 1;
+        req.batch->remaining_tiles.fetch_sub(1, std::memory_order_acq_rel) - 1;
 
     if (tiles_left == 0) {
       // last tile to finish - emit single completion for entire batch
+      req.batch->t_last_done = wall_clock_time();
+
       Completion batch_comp;
       batch_comp.future_id = req.future_id;
       batch_comp.ok = !req.batch->any_failed.load(std::memory_order_relaxed);
@@ -630,7 +692,20 @@ class ConnectorBase : public IStorageConnector {
           req.batch->batch_op == Op::BATCH_TILE_DELETE) {
         batch_comp.result_bytes = std::move(req.batch->per_key_results);
       }
-      push_completion(std::move(batch_comp));
+
+      BatchTiming timing;
+      timing.future_id = req.future_id;
+      timing.op = req.batch->batch_op;
+      timing.num_keys = req.batch->num_keys;
+      timing.total_bytes = req.batch->total_bytes;
+      timing.t_submit = req.batch->t_submit;
+      timing.t_first_dequeue =
+          req.batch->t_first_dequeue.load(std::memory_order_relaxed);
+      timing.t_first_byte =
+          req.batch->t_first_byte.load(std::memory_order_relaxed);
+      timing.t_last_done = req.batch->t_last_done;
+
+      push_completion(std::move(batch_comp), std::move(timing));
     }
   }
 
@@ -658,6 +733,14 @@ class ConnectorBase : public IStorageConnector {
   // completion queue (CQ)
   std::mutex comp_mu_;
   std::queue<Completion> completions_;
+
+  // per-batch stage-timing records, drained via drain_batch_timings().
+  // Bounded so consumers that never drain timings (older callers, mocks)
+  // stay at a fixed memory cost (~300 KB worst case); drops are counted and
+  // logged once. Guarded by comp_mu_.
+  static constexpr size_t kMaxPendingTimings = 4096;
+  std::vector<BatchTiming> batch_timings_;
+  size_t dropped_timings_ = 0;
 
   std::vector<std::thread> workers_;
   // Populated only during start_workers() (single-threaded construction).

@@ -568,6 +568,9 @@ void RedisConnector::do_batch_get_pipelined(WorkerConn& conn,
   // 2. N replies
   for (size_t i = 0; i < num_keys; ++i) {
     std::string line = conn.recv_line();
+    if (i == 0) {
+      note_first_byte(req);
+    }
     if (!line.empty() && line[0] == '-') {
       // per-key server error; recv_line consumed the full error line, so
       // the connection stays in sync for the remaining replies
@@ -601,6 +604,7 @@ void RedisConnector::do_batch_get_mget(WorkerConn& conn, const Request& req) {
 
   // 1. array header: *<N>\r\n
   int64_t num_replies = parse_reply_int(conn.recv_line(), '*', "MGET");
+  note_first_byte(req);
   if (num_replies != static_cast<int64_t>(num_keys)) {
     throw std::runtime_error("MGET: reply count mismatch: expected " +
                              std::to_string(num_keys) + ", got " +
