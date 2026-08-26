@@ -317,11 +317,85 @@ done
 Notes: the third config (`target = value size`) forces the most tiles the
 byte rule allows — with 64 workers it still cannot go below ~keys/64 keys
 per tile, which is exactly why it cannot match single mode at small values
-(the windowed v3 can). `--warmup 0` keeps batch 0 as the cold/residency
-signal; reading promotes, so within a (VMB, CTXGB) cell configs later in
-the inner loop see a warmer slice — if that matters, randomize or rotate
-the config order across repeats. On Flex, reseed + settle between full
-sweeps; never compare across reseeds.
+(the windowed v3 can). On Flex, reseed + settle between full sweeps; never
+compare across reseeds.
+
+#### 6b-caveats: Flex residency confounds in the naive loop (and fixes)
+
+Reading a flash value PROMOTES it into the ~10 GB RAM tier, so the naive
+loop above has three systematic warming layers:
+
+1. **Config order within a cell**: the first config (single) pays the cold
+   flash reads and leaves the set promoted; later configs measure warmer
+   data. When the cell's read set fits the RAM tier (CTXGB 4.2 and 8.4 GB
+   both do), configs 2–3 measure RAM-resident, not flash — and the bias
+   always lands AGAINST single, which must not be how "single loses on
+   flash" gets concluded.
+2. **Nested key ranges across CTXGB**: keys index from 0, so CTXGB=8.4's
+   set contains CTXGB=4.2's just-read set — larger contexts start with a
+   hot prefix and a cold tail. The CTXGB axis is confounded with residency.
+3. **Cross-VMB eviction**: each VMB's 16.8 GB cell evicts the previous
+   block's promotions, so only the FIRST cell of each VMB block starts
+   cold.
+
+`--batches` on Flex is NOT variance reduction (its RAM-DB role): batches
+re-read the same keys, each pass promotes, so per-batch rates warm
+monotonically toward steady state and `agg_gbps` averages an arbitrary
+point on that trajectory — its value depends on the batch count. Never
+compare Flex agg_gbps across different batch counts or starting residency.
+Use the per-batch lines: batch 0 = cold, last-batch plateau = steady state.
+(The batch barrier — one straggler tile sets the batch time — mirrors how
+the LMCache load path consumes a batch, so its tail-sensitivity is a
+feature.)
+
+**Revised protocol** — measure the two transferable regimes per cell
+instead of a blend, with an *eviction scrub* (read a sacrificial
+≥RAM-tier-sized slice to flush promotions) between measurements:
+
+```bash
+scrub() {  # evict promoted values: read the 16.8 GB 33.6MB slice once
+  python benchmarks/storage_backend_io/connector_stage_bench.py \
+    --host $REDIS_HOST --port $REDIS_PORT --password $REDIS_PASSWORD \
+    --num-workers 64 --num-keys 500 --value-mb 33.6 --batches 1 --warmup 0 \
+    --get-batch-mode pipeline --key-prefix $PREFIX --skip-set --no-cleanup \
+    > /dev/null
+}
+
+for VMB in 4.2 8.4 16.8; do            # 33.6 slice is the scrubber
+  for CTXGB in 4.2 8.4 16.8; do
+    KEYS=$(python3 -c "print(round($CTXGB*1000/$VMB))")
+    for CFG in "--get-batch-mode single" \
+               "--get-batch-mode pipeline --get-target-tile-mb 32" \
+               "--get-batch-mode pipeline --get-target-tile-mb $VMB"; do
+      scrub
+      # cold pass: batch 0 on a scrubbed slice
+      python benchmarks/storage_backend_io/connector_stage_bench.py \
+        --host $REDIS_HOST --port $REDIS_PORT --password $REDIS_PASSWORD \
+        --num-workers 64 --batches 1 --warmup 0 \
+        --num-keys $KEYS --value-mb $VMB $CFG \
+        --key-prefix $PREFIX --skip-set --no-cleanup
+      # steady pass: warmup does the promoting, aggregate is steady state
+      python benchmarks/storage_backend_io/connector_stage_bench.py \
+        --host $REDIS_HOST --port $REDIS_PORT --password $REDIS_PASSWORD \
+        --num-workers 64 --batches 4 --warmup 3 \
+        --num-keys $KEYS --value-mb $VMB $CFG \
+        --key-prefix $PREFIX --skip-set --no-cleanup
+    done
+  done
+done
+```
+
+Also: rotate config order on a repeat run to bound residual position bias;
+record bigstore RAM/flash object counts (`rladmin info db` / metrics
+endpoint) before each cell as residency evidence; and run `iostat -xm 5` on
+the Redis node during one pure-read cold pass — sustained flash WRITES
+during a read-only pass = promotion write-amplification (the open RE-Flex
+question; if writes ≈ 0, churn costs only the flash reads themselves and
+blended numbers are honest). If scrubbing everywhere is too slow, the
+minimum fix is: scrub once per cell, rotate config order, and read
+cold/steady off the per-batch lines. Production-transferable throughput =
+interpolate the cold and steady endpoints by the workload's expected
+residency fraction — no single blended number is "realistic".
 
 ### 6c. Concurrency simulation
 
