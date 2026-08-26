@@ -11,6 +11,60 @@ integration tests incl. byte-tiling/single-mode/deprecation/counters, 184
 mp_observability tests, ruff + clang-format clean); everything below runs on
 the bench host.
 
+## Getting this branch onto the vLLM host
+
+The branch is pushed to the fork: `github.com/c-col/LMCache`, branch
+`pipelined-get-v2` (3 commits on top of `stage-timing-instrumentation`).
+Once SSH'd into the g7 vLLM host:
+
+```bash
+# 1. find the LMCache checkout the bench venv actually uses
+#    ("Editable project location" is the checkout; if there is no Editable
+#    line, lmcache was installed from a wheel — clone the fork instead)
+pip show lmcache | grep -Ei 'location|editable'
+cd <editable-project-location>
+```
+
+```bash
+# 2. make sure the checkout can see the fork, then fetch
+git remote -v
+# if no remote points at github.com/c-col/LMCache, add one:
+#   git remote add ccol https://github.com/c-col/LMCache.git
+git fetch --all
+```
+
+```bash
+# 3. switch to the branch (stash first if the tree is dirty --
+#    `git status --short` -- so nothing local is lost)
+git checkout pipelined-get-v2
+git log --oneline -3   # expect: 894c7f9e / 3b8fc7af / 501ac4d2
+```
+
+```bash
+# 4. rebuild -- REQUIRED: the C++ extension changed (new ctor arg, new
+#    bindings), so the old .so will not match the Python plumbing.
+#    Run inside the fork venv; takes a few minutes.
+uv pip install -e . --no-build-isolation
+```
+
+```bash
+# 5. verify the new surface is live before benchmarking
+python -c "
+from lmcache.lmcache_redis import LMCacheRedisClient as C
+assert '_plan_get_tiles' in dir(C) and 'error_counters' in dir(C)
+assert 'get_target_tile_bytes' in (C.__init__.__doc__ or '')
+print('pipelined-get-v2 extension OK')"
+```
+
+If the host checkout was never a git clone (wheel install), clone fresh
+instead: `git clone -b pipelined-get-v2 https://github.com/c-col/LMCache.git
+&& cd LMCache && uv pip install -e . --no-build-isolation` (in the venv).
+
+For rapid iteration on *uncommitted* local edits, rsync from the Mac instead
+of going through GitHub (run locally, not on the host):
+`rsync -az --exclude .git --exclude '*.so' ~/Documents/LMCache-fork/
+<user>@<g7-host>:<checkout-path>/` — then rerun step 4 on the host.
+
 ## 0. Prerequisites (record before any numbers)
 
 ```bash
