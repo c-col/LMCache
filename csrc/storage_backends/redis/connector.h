@@ -46,6 +46,16 @@ struct WorkerConn {
   std::string size_header_buf;
   std::string cmd_buf;
 
+  // buffered reply reader: recv_line/recv_exactly consume from this buffer
+  // before touching the socket, so reply headers cost ~1 syscall per socket
+  // read instead of 1 per byte. Only whole-reply payload bytes bypass it
+  // (recv_exactly reads the unbuffered remainder straight into the caller's
+  // destination — zero copy for large values).
+  static constexpr size_t rbuf_capacity = 64 * 1024;
+  std::vector<char> rbuf;
+  size_t rbuf_pos = 0;  // next unconsumed byte
+  size_t rbuf_len = 0;  // valid bytes in rbuf
+
   // pre-computed constants (for comparisons)
   static constexpr std::string_view crlf = "\r\n";
   static constexpr size_t crlf_len = crlf.size();
@@ -93,6 +103,8 @@ struct WorkerConn {
   void recv_exactly(void* buf, size_t len);
   void drain_exactly(size_t len);
   std::string recv_line();
+  // refill rbuf from the socket (blocks for >= 1 byte); pos/len are reset
+  void fill_rbuf();
   const std::string& make_key_header(const std::string& key);
   const std::string& make_size_header(size_t batch_chunk_num_bytes);
 

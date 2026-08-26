@@ -54,6 +54,11 @@ void WorkerConn::connect(const std::string& h, int p) {
   host = h;
   port = p;
 
+  // fresh connection: no buffered bytes can be valid
+  rbuf.resize(rbuf_capacity);
+  rbuf_pos = 0;
+  rbuf_len = 0;
+
   // 1. create socket
   fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
@@ -167,9 +172,38 @@ void WorkerConn::send_multipart(
   }
 }
 
+void WorkerConn::fill_rbuf() {
+  for (;;) {
+    ssize_t n = ::recv(fd, rbuf.data(), rbuf.size(), 0);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw std::runtime_error("socket recv failed");
+    }
+    if (n == 0) {
+      throw std::runtime_error("socket recv failed: connection closed");
+    }
+    rbuf_pos = 0;
+    rbuf_len = static_cast<size_t>(n);
+    return;
+  }
+}
+
 void WorkerConn::recv_exactly(void* buf, size_t len) {
-  size_t recv_so_far = 0;
   char* ptr = static_cast<char*>(buf);
+  size_t recv_so_far = 0;
+
+  // 1. consume any buffered reply bytes first (they arrived with an earlier
+  // header read and MUST be used before touching the socket again)
+  if (rbuf_pos < rbuf_len) {
+    size_t take = std::min(len, rbuf_len - rbuf_pos);
+    std::memcpy(ptr, rbuf.data() + rbuf_pos, take);
+    rbuf_pos += take;
+    recv_so_far = take;
+  }
+
+  // 2. read the remainder straight into the destination (zero copy)
   while (recv_so_far < len) {
     ssize_t n = ::recv(fd, ptr + recv_so_far, len - recv_so_far, 0);
     if (n < 0) {
@@ -200,11 +234,25 @@ std::string WorkerConn::recv_line() {
   std::string line;
   line.reserve(128);
   for (;;) {
-    char c;
-    recv_exactly(&c, 1);
-    line.push_back(c);
+    if (rbuf_pos == rbuf_len) {
+      fill_rbuf();
+    }
+    const char* base = rbuf.data() + rbuf_pos;
+    size_t avail = rbuf_len - rbuf_pos;
+    const char* nl = static_cast<const char*>(std::memchr(base, '\n', avail));
+    if (nl == nullptr) {
+      // no terminator yet: take everything buffered and read more
+      line.append(base, avail);
+      rbuf_pos = rbuf_len;
+      continue;
+    }
+    // take through the '\n' (RESP lines end \r\n; a bare '\n' cannot occur
+    // in a reply line, but re-loop defensively if the '\r' is missing)
+    size_t take = static_cast<size_t>(nl - base) + 1;
+    line.append(base, take);
+    rbuf_pos += take;
     size_t n = line.size();
-    if (n >= 2 && line[n - 2] == '\r' && line[n - 1] == '\n') {
+    if (n >= 2 && line[n - 2] == '\r') {
       return line;
     }
   }
