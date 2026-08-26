@@ -729,4 +729,8 @@ class TestBatchTimings:
         assert timing is not None
         # every record was already drained by _wait
         assert client.client.drain_batch_timings() == []
-        assert client.timings == {}
+        # NOTE: client.timings is NOT empty here — the stored_keys fixture's
+        # plain batch_set() drained its own SET record into the dict and
+        # nothing pops it (only the *_timed helpers pop their future_id).
+        # The connector-side contract is the empty drain asserted above.
+        assert all(t[0] == "set" for t in client.timings.values())
