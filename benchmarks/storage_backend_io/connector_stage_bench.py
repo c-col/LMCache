@@ -102,6 +102,37 @@ class SyncTimedClient:
     def batch_delete(self, keys: list[str]):
         return self._wait(self.client.submit_batch_delete(keys))
 
+    def submit_get(self, keys: list[str], bufs: list[bytearray]) -> int:
+        """Submit a GET batch without waiting; returns the future_id."""
+        views = [memoryview(b) for b in bufs]
+        return self.client.submit_batch_get(keys, views)
+
+    def wait_any(self, fids: set[int], timeout_s: float = 300.0):
+        """Block until at least one fid in ``fids`` completes.
+
+        Returns a list of (fid, timing) for every completed fid found;
+        raises on a failed batch.
+        """
+        done = [f for f in fids if f in self.pending]
+        while not done:
+            events = self.poll.poll(timeout_s * 1000)
+            if not events:
+                raise TimeoutError(f"none of {sorted(fids)} completed")
+            completions = self.client.drain_completions()
+            t_consumed = time.time()
+            for fid, op, nk, nb, t0, t1, t2, t3 in self.client.drain_batch_timings():
+                self.timings[fid] = (op, nk, nb, t0, t1, t2, t3, t_consumed)
+            for fid, ok, err, bools in completions:
+                self.pending[fid] = (ok, err, bools)
+            done = [f for f in fids if f in self.pending]
+        out = []
+        for f in done:
+            ok, err, _ = self.pending.pop(f)
+            if not ok:
+                raise RuntimeError(f"batch {f} failed: {err}")
+            out.append((f, self.timings.pop(f, None)))
+        return out
+
     def close(self):
         self.client.close()
 
@@ -128,22 +159,27 @@ def _pct(values: list[float], p: float) -> float:
 def run_sweep_point(
     args: argparse.Namespace, num_workers: int, num_keys: int, value_bytes: int
 ) -> None:
-    keys = [
-        f"stagebench{_KEY_NONCE}_{value_bytes}_{i}" for i in range(num_keys)
-    ]
+    prefix = args.key_prefix or f"stagebench{_KEY_NONCE}"
+    keys = [f"{prefix}_{value_bytes}_{i}" for i in range(num_keys)]
     payloads = [_make_payload(i, value_bytes) for i in range(num_keys)]
     total_gb = num_keys * value_bytes / 1e9
+    inflight = max(1, args.inflight_batches) if args.op == "get" else 1
 
     client = SyncTimedClient(args, num_workers)
     try:
-        client.batch_set(keys, payloads)
+        if not args.skip_set:
+            client.batch_set(keys, payloads)
 
         op = args.op
-        bufs = [bytearray(value_bytes) for _ in range(num_keys)]
+        # one destination buffer set per in-flight batch slot
+        buf_slots = [
+            [bytearray(value_bytes) for _ in range(num_keys)]
+            for _ in range(inflight)
+        ]
 
-        def run_batch():
+        def run_batch(slot: int = 0):
             if op == "get":
-                return client.batch_get(keys, bufs)
+                return client.batch_get(keys, buf_slots[slot])
             return client.batch_set(keys, payloads)
 
         for _ in range(args.warmup):
@@ -157,10 +193,33 @@ def run_sweep_point(
             f"\n== op={op} workers={num_workers} keys={num_keys} "
             f"value={value_bytes / 1e6:.2f}MB batch={total_gb:.3f}GB "
             f"mode={args.get_batch_mode} min_keys_per_tile="
-            f"{args.get_min_keys_per_tile}"
+            f"{args.get_min_keys_per_tile} inflight={inflight}"
         )
-        for b in range(args.batches):
-            timing = run_batch()
+
+        wall_start = time.perf_counter()
+        if inflight == 1:
+            timings = []
+            for _ in range(args.batches):
+                timings.append(run_batch())
+        else:
+            # keep `inflight` GET batches outstanding, like the serving
+            # stack's concurrent load tasks sharing one client
+            timings = []
+            fid_slots: dict[int, int] = {}
+            submitted = 0
+            for slot in range(min(inflight, args.batches)):
+                fid_slots[client.submit_get(keys, buf_slots[slot])] = slot
+                submitted += 1
+            while len(timings) < args.batches:
+                for fid, timing in client.wait_any(set(fid_slots)):
+                    slot = fid_slots.pop(fid)
+                    timings.append(timing)
+                    if submitted < args.batches:
+                        fid_slots[client.submit_get(keys, buf_slots[slot])] = slot
+                        submitted += 1
+        wall_seconds = time.perf_counter() - wall_start
+
+        for b, timing in enumerate(timings):
             if timing is None:
                 print(
                     "  (no timing record — is the connector built with "
@@ -180,6 +239,7 @@ def run_sweep_point(
                 f"total {st['total']:8.2f}ms | {rate:6.2f} GB/s"
             )
 
+        agg_gbps = args.batches * total_gb / wall_seconds if wall_seconds > 0 else 0.0
         print("  stage       mean        p50        p99   (ms)")
         for k in ("queue", "dispatch", "transfer", "handoff", "total"):
             vals = per_stage[k]
@@ -187,6 +247,10 @@ def run_sweep_point(
                 f"  {k:<9s} {statistics.mean(vals):9.2f} "
                 f"{_pct(vals, 50):10.2f} {_pct(vals, 99):10.2f}"
             )
+        print(
+            f"  aggregate: {args.batches} batches x {total_gb:.3f}GB in "
+            f"{wall_seconds:.2f}s = {agg_gbps:.2f} GB/s wall-clock"
+        )
         # machine-readable summary (grep '^CSV')
         print(
             "CSV,"
@@ -205,6 +269,8 @@ def run_sweep_point(
                     round(statistics.mean(per_stage["total"]), 3),
                     round(statistics.mean(gbps), 3),
                     round(_pct(gbps, 50), 3),
+                    inflight,
+                    round(agg_gbps, 3),
                 )
             )
         )
@@ -259,12 +325,36 @@ def main() -> None:
         action="store_false",
         help="leave benchmark keys in Redis after each sweep point",
     )
+    parser.add_argument(
+        "--inflight-batches",
+        type=int,
+        default=1,
+        help=(
+            "keep N GET batches outstanding on the one client (mimics the "
+            "serving stack's concurrent load tasks). Memory: N full buffer "
+            "sets. GET only; ignored for --op set."
+        ),
+    )
+    parser.add_argument(
+        "--key-prefix",
+        help=(
+            "fixed key prefix instead of the per-process nonce, so parallel "
+            "processes share one keyspace (e.g. to test Flex concurrency "
+            "without growing the working set). Pair with --skip-set "
+            "--no-cleanup on all but one process."
+        ),
+    )
+    parser.add_argument(
+        "--skip-set",
+        action="store_true",
+        help="assume the keyspace already exists (see --key-prefix)",
+    )
 
     args = parser.parse_args()
     print(
         "CSV,op,get_batch_mode,num_workers,num_keys,value_bytes,"
         "queue_ms,dispatch_ms,transfer_ms,handoff_ms,total_ms,"
-        "gbps_mean,gbps_p50"
+        "gbps_mean,gbps_p50,inflight,agg_gbps"
     )
     for workers in [int(x) for x in args.num_workers.split(",")]:
         for nkeys in [int(x) for x in args.num_keys.split(",")]:
