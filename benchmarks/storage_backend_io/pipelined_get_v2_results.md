@@ -18,37 +18,32 @@ The branch is pushed to the fork: `github.com/c-col/LMCache`, branch
 Once SSH'd into the g7 vLLM host:
 
 ```bash
-# 1. find the LMCache checkout the bench venv actually uses
-#    ("Editable project location" is the checkout; if there is no Editable
-#    line, lmcache was installed from a wheel — clone the fork instead)
-pip show lmcache | grep -Ei 'location|editable'
-cd <editable-project-location>
+source ~/bench-env.sh
 ```
 
 ```bash
-# 2. make sure the checkout can see the fork, then fetch
-git remote -v
-# if no remote points at github.com/c-col/LMCache, add one:
-#   git remote add ccol https://github.com/c-col/LMCache.git
-git fetch --all
+cd ~/src && git clone --branch pipelined-get-v2 https://github.com/c-col/LMCache.git LMCache-fork
 ```
 
 ```bash
-# 3. switch to the branch (stash first if the tree is dirty --
-#    `git status --short` -- so nothing local is lost)
-git checkout pipelined-get-v2
-git log --oneline -3   # expect: 894c7f9e / 3b8fc7af / 501ac4d2
+# check for nvcc access
+source ~/.venv/bin/activate && which nvcc || ls /usr/local/cuda/bin/nvcc 2>/dev/null || echo "NO NVCC"
+
+# if nvcc found, do:
+export PATH=/usr/local/cuda/bin:$PATH CUDA_HOME=/usr/local/cuda
 ```
 
 ```bash
-# 4. rebuild -- REQUIRED: the C++ extension changed (new ctor arg, new
-#    bindings), so the old .so will not match the Python plumbing.
-#    Run inside the fork venv; takes a few minutes.
+# rebuild -- REQUIRED: the C++ extension changed (new ctor arg, new
+#   bindings), so the old .so will not match the Python plumbing.
+#   Run inside the fork venv; takes a few minutes.
+cd ~/src/LMCache-fork
+
 uv pip install -e . --no-build-isolation
 ```
 
 ```bash
-# 5. verify the new surface is live before benchmarking
+# verify the new surface is live before benchmarking
 python -c "
 from lmcache.lmcache_redis import LMCacheRedisClient as C
 assert '_plan_get_tiles' in dir(C) and 'error_counters' in dir(C)
@@ -56,23 +51,24 @@ assert 'get_target_tile_bytes' in (C.__init__.__doc__ or '')
 print('pipelined-get-v2 extension OK')"
 ```
 
-If the host checkout was never a git clone (wheel install), clone fresh
-instead: `git clone -b pipelined-get-v2 https://github.com/c-col/LMCache.git
-&& cd LMCache && uv pip install -e . --no-build-isolation` (in the venv).
-
-For rapid iteration on *uncommitted* local edits, rsync from the Mac instead
-of going through GitHub (run locally, not on the host):
-`rsync -az --exclude .git --exclude '*.so' ~/Documents/LMCache-fork/
-<user>@<g7-host>:<checkout-path>/` — then rerun step 4 on the host.
-
 ## 0. Prerequisites (record before any numbers)
 
+The Redis integration suite needs a throwaway LOCAL redis on port 6399 — do
+NOT point it at the RE cluster (the suite has no auth plumbing, and its
+commandstats-delta assertions assume a dedicated quiet server). The `env -u`
+matters: bench-env.sh exports REDIS_HOST/REDIS_PORT for the RE endpoint, and
+the suite silently skips everything when its unauthenticated ping to that
+host fails.
+
 ```bash
-# rebuild the wheel on the bench host, in the fork venv
-uv pip install -e . --no-build-isolation
-pytest -x tests/v1/storage_backend/test_redis_native_batch_integration.py -q
-pytest -x tests/v1/distributed/test_native_connector_l2_adapter.py -q
-pytest -q tests/v1/mp_observability/subscribers/metrics/
+sudo apt-get install -y redis-server redis-tools
+redis-server --port 6399 --daemonize yes --save '' --appendonly no
+```
+
+```bash
+env -u REDIS_HOST -u REDIS_PORT pytest -x tests/v1/storage_backend/test_redis_native_batch_integration.py -q   # expect 76 passed
+pytest -x tests/v1/distributed/test_native_connector_l2_adapter.py -q   # expect 87 passed
+pytest -q tests/v1/mp_observability/subscribers/metrics/                # expect 184 passed
 ```
 
 ```bash
@@ -83,10 +79,10 @@ sudo /opt/redislabs/bin/rladmin info proxy all | grep -i thread
 
 Record here:
 
-- RAM DB: type/shards/proxy threads: ____
-- Flex DB: type/shards/proxy threads/RAM-tier size: ____
-- Flex seed/settle protocol used (flush → seed → sleep 90): ____
-- Client instance / kernel / date: ____
+- RAM DB: type/shards/proxy threads: ?/4/24
+- Flex DB: type/shards/proxy threads/RAM-tier size: ?/4/24/10%
+- Flex seed/settle protocol used (flush → seed → sleep 90): ???
+- Client instance / kernel / date: g7.24xlarge + i8ge.48xlarge / Redis node is ubuntu 22.04 server / August 26 2026
 
 ## 1. Sweep matrix
 
