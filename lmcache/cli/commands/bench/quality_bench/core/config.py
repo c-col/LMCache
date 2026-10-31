@@ -159,6 +159,15 @@ class QualityRunConfig:
         min_unit_tokens: ``concatenated`` only: the minimum size of a
             stored unit, in tokens. Units hold whole contexts, so the last
             may be shorter.
+        store_instructions: Whether store requests carry the system
+            prompt's instructions ahead of the passages. ``None`` means the
+            scenario's default: yes for ``independent`` and ``reordered``,
+            no for ``concatenated`` (which cannot store them). Without
+            them, the store keeps the system block's padding and end
+            marker, so passages sit at the same positions and chunk grid
+            and the measured prompts are unchanged; only what the stored
+            KV attended to differs, and the first passage is no longer an
+            exact prefix of the measured prompt.
     """
 
     model: str
@@ -176,6 +185,7 @@ class QualityRunConfig:
     seed: int = 42
     filler: Filler | None = Filler.DOTS
     min_unit_tokens: int = 8192
+    store_instructions: bool | None = None
 
     def __post_init__(self) -> None:
         if not self.model:
@@ -215,6 +225,18 @@ class QualityRunConfig:
             raise ValueError(
                 f"min_unit_tokens must be >= 0, got {self.min_unit_tokens}"
             )
+        if concatenated and self.store_instructions:
+            raise ValueError(
+                "--store-instructions does not apply to --scenario concatenated, "
+                "whose units are stored without the system prompt"
+            )
+
+    @property
+    def stores_instructions(self) -> bool:
+        """Whether store requests carry the instructions (resolved default)."""
+        if self.scenario is ReuseScenario.CONCATENATED:
+            return False
+        return self.store_instructions is not False
 
     def arm(self, role: ArmRole) -> ArmEndpoint:
         """Return the arm with *role*.
@@ -260,6 +282,14 @@ class QualityRunConfig:
             **(
                 {"min_unit_tokens": self.min_unit_tokens}
                 if self.scenario is ReuseScenario.CONCATENATED
+                else {}
+            ),
+            # Recorded only when off, so plans that predate the option keep
+            # their fingerprints.
+            **(
+                {"store_instructions": False}
+                if self.scenario is not ReuseScenario.CONCATENATED
+                and not self.stores_instructions
                 else {}
             ),
         }

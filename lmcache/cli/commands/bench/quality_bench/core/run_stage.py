@@ -169,6 +169,19 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
         "context (default: 8192).",
     )
     workload.add_argument(
+        "--store-instructions",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="independent / reordered: whether store requests carry the "
+        "system prompt's instructions ahead of the passages (default: yes). "
+        "With --no-store-instructions the stored passages keep their "
+        "positions and chunk grid (the instructions are replaced by padding) "
+        "and the measured prompts are unchanged, but the passages' cached KV "
+        "is computed without the instructions and the first passage is no "
+        "longer an exact prefix of the measured prompt. Not applicable to "
+        "concatenated, which never stores them.",
+    )
+    workload.add_argument(
         "--chunk-size",
         type=int,
         default=256,
@@ -256,6 +269,7 @@ def run_config_from_args(args: argparse.Namespace) -> QualityRunConfig:
         seed=args.seed,
         filler=_filler(args),
         min_unit_tokens=args.min_unit_tokens,
+        store_instructions=args.store_instructions,
     )
 
 
@@ -315,6 +329,7 @@ def build_quality_plan(config: QualityRunConfig) -> QualityPlan:
         config.seed,
         unit_samples=all_samples,
         min_unit_tokens=config.min_unit_tokens,
+        store_instructions=config.stores_instructions,
     )
 
 
@@ -441,7 +456,14 @@ def run_quality_run(args: argparse.Namespace) -> None:
     print(
         f"bench quality run: {len(plan.samples)} questions, "
         f"{len(plan.store_requests)} store requests, "
-        f"scenario={plan.scenario.value}, arms: {arm_names}"
+        f"scenario={plan.scenario.value}"
+        + (
+            " (stored without instructions)"
+            if plan.scenario is not ReuseScenario.CONCATENATED
+            and not config.stores_instructions
+            else ""
+        )
+        + f", arms: {arm_names}"
     )
     if plan.padding is not None:
         print(

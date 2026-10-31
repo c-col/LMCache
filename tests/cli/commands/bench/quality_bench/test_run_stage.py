@@ -428,6 +428,73 @@ class TestFiller:
         assert not os.path.exists(out)
 
 
+class TestStoreInstructions:
+    def test_flag_turns_them_off(self) -> None:
+        config = run_stage.run_config_from_args(
+            parse_run(
+                "--reference-url",
+                REF_URL,
+                "--model",
+                "m",
+                "--dataset",
+                "d",
+                "--no-store-instructions",
+            )  # fmt: skip
+        )
+        assert config.store_instructions is False
+        assert config.plan_settings()["store_instructions"] is False
+
+    def test_flag_is_refused_for_concatenated(self) -> None:
+        with pytest.raises(ValueError, match="--store-instructions"):
+            run_stage.run_config_from_args(
+                parse_run(
+                    "--reference-url",
+                    REF_URL,
+                    "--model",
+                    "m",
+                    "--dataset",
+                    "d",
+                    "--scenario",
+                    "concatenated",
+                    "--store-instructions",
+                )  # fmt: skip
+            )
+
+    def test_stores_omit_them_and_the_setting_is_kept(
+        self, dataset, engines, tmp_path, judge_client, capsys
+    ) -> None:
+        engines[CANDIDATE_URL] = FakeSender(answering(RIGHT))
+        out = str(tmp_path / "out")
+        run_both(dataset, out, "--no-store-instructions")
+        assert "(stored without instructions)" in capsys.readouterr().out
+        with open(os.path.join(out, PLAN_FILE)) as f:
+            assert json.load(f)["settings"]["store_instructions"] is False
+        stores = [
+            m for _, m, max_tokens in engines[CANDIDATE_URL].sent if max_tokens == 1
+        ]
+        assert stores
+        assert all("Answer the question" not in m[0]["content"] for m in stores)
+        analyze(out)
+        assert summary(out)["settings"]["store_instructions"] is False
+
+    def test_mixing_with_a_default_run_is_refused(
+        self, dataset, engines, tmp_path, capsys
+    ) -> None:
+        out = str(tmp_path / "out")
+        run(dataset, out, "--reference-url", REF_URL)
+        error = expect_setup_error(
+            capsys,
+            lambda: run(
+                dataset,
+                out,
+                "--candidate-url",
+                CANDIDATE_URL,
+                "--no-store-instructions",
+            ),  # fmt: skip
+        )
+        assert "store_instructions" in error
+
+
 class TestConcatenatedRun:
     def test_filler_is_refused(self) -> None:
         with pytest.raises(ValueError, match="--filler"):

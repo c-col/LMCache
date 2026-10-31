@@ -11,6 +11,7 @@ from lmcache.cli.commands.bench.quality_bench.core.config import (
     JudgeSettings,
     QualityAnalyzeConfig,
     QualityRunConfig,
+    ReuseScenario,
     VerdictMetric,
 )
 
@@ -92,6 +93,35 @@ class TestQualityRunConfig:
         assert _run_config().plan_settings() == (
             _run_config(arms=only_candidate).plan_settings()
         )
+
+
+class TestStoreInstructions:
+    def test_default_is_on_and_not_recorded(self) -> None:
+        config = _run_config()
+        assert config.stores_instructions
+        assert "store_instructions" not in config.plan_settings()
+
+    def test_off_is_recorded(self) -> None:
+        config = _run_config(store_instructions=False)
+        assert not config.stores_instructions
+        assert config.plan_settings()["store_instructions"] is False
+
+    def test_explicit_on_matches_the_default(self) -> None:
+        assert (
+            _run_config(store_instructions=True).plan_settings()
+            == _run_config().plan_settings()
+        )
+
+    def test_concatenated_never_stores_them(self) -> None:
+        config = _run_config(scenario=ReuseScenario.CONCATENATED, filler=None)
+        assert not config.stores_instructions
+        assert "store_instructions" not in config.plan_settings()
+        with pytest.raises(ValueError, match="--store-instructions"):
+            _run_config(
+                scenario=ReuseScenario.CONCATENATED,
+                filler=None,
+                store_instructions=True,
+            )
 
 
 class TestQualityAnalyzeConfig:

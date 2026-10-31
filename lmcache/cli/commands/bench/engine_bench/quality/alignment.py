@@ -73,6 +73,12 @@ _PAD_UNITS = {Filler.DOTS: " .", Filler.DASHES: " -"}
 # first passage's "Passage" never merges into it.
 _SYSTEM_TAIL = "\nend of instructions 0"
 
+# Starts and ends :meth:`ChunkAligner.lead_block`. The lead opens with a
+# non-space character (chat templates may strip leading whitespace) and,
+# like the system block, ends on a fixed digit.
+_LEAD_TEXT = "."
+_LEAD_TAIL = "\nend of padding 0"
+
 
 def block_id(text: str) -> str:
     """Return the id a framed block is labelled with.
@@ -213,6 +219,32 @@ class ChunkAligner:
             "System block: %d tokens after a %d-token chat-template prefix",
             self.token_length(block),
             prefix_tokens,
+        )
+        return block
+
+    def lead_block(self, system_block: str) -> str:
+        """Return a padding-only block that stands in for *system_block*.
+
+        It fills the same tokens after the chat-template prefix, so passages
+        after it start at the same token position, on the same chunk
+        boundary. It holds no instructions: ``.``, then the filler, then an
+        end marker (``words``: ``.`` and random words). Unlike
+        :meth:`system_block`, it does not change :meth:`system_pad_tokens`.
+
+        Args:
+            system_block: A block from :meth:`system_block`.
+
+        Returns:
+            The lead block.
+        """
+        prefix_tokens = self._chat_prefix_tokens()
+        end = prefix_tokens + self.token_length(system_block)
+        if self._filler is Filler.WORDS:
+            return self._pad_to_multiple(
+                _LEAD_TEXT, prefix_tokens, random.Random(self._seed), min_end=end
+            )
+        block, _ = self._pad_framed(
+            "", _LEAD_TEXT, _LEAD_TAIL, prefix_tokens, min_end=end
         )
         return block
 
@@ -408,7 +440,7 @@ class ChunkAligner:
         return self.token_length(head)
 
     def _pad_framed(
-        self, head: str, text: str, tail: str, offset: int
+        self, head: str, text: str, tail: str, offset: int, min_end: int = 0
     ) -> tuple[str, int]:
         """Pad ``head + text + "\\n\\n" + unit*n + tail`` to a chunk boundary.
 
@@ -417,6 +449,7 @@ class ChunkAligner:
             text: The passage or system prompt.
             tail: Text after the padding (the end marker).
             offset: Tokens already ahead of the block.
+            min_end: Pad to at least this token position (a chunk boundary).
 
         Returns:
             The padded block and its padding token count. When no count
@@ -430,7 +463,7 @@ class ChunkAligner:
             return head + text + "\n\n" + unit * n + tail
 
         base = self.token_length(build(0))
-        target = math.ceil((offset + base) / align) * align
+        target = math.ceil(max(offset + base, min_end) / align) * align
         block = build(0)
         for _ in range(_PAD_TARGETS):
             n = target - offset - base
@@ -450,14 +483,19 @@ class ChunkAligner:
         )
         return block, self.token_length(block) - base
 
-    def _pad_to_multiple(self, text: str, offset: int, rng: random.Random) -> str:
-        """Pad *text* so ``offset + len(text)`` is a whole chunk count."""
+    def _pad_to_multiple(
+        self, text: str, offset: int, rng: random.Random, min_end: int = 0
+    ) -> str:
+        """Pad *text* so ``offset + len(text)`` is a whole chunk count.
+
+        The padded block ends at or past *min_end* (a chunk boundary).
+        """
         pool = self._pool
         if pool is None:
             raise RuntimeError("word padding needs the words filler")
         align = self._align_tokens
         total = offset + self.token_length(text)
-        target = math.ceil(total / align) * align
+        target = math.ceil(max(total, min_end) / align) * align
         if target == total:
             return text
 

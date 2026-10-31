@@ -177,6 +177,26 @@ Every passage a question uses is stored before the first question is
 measured, so `--limit` (measuring a prefix of the dataset) never changes what
 a measured question can reuse.
 
+**Store requests and the instructions.** `independent` and `reordered`
+store passages after the same system block the measured prompt opens with
+(`compose_store_messages`). Two things follow. Passages sit at the same
+positions and chunk phase in both prompts, because everything ahead of the
+first passage is a whole number of chunks. The first passage of every
+question is also an exact prefix of its measured prompt, and so is not
+blended. The instructions are not needed for the first: with
+`--no-store-instructions`, store requests open with
+`ChunkAligner.lead_block` instead -- `.`, the filler, and `end of padding 0`,
+filling exactly the system block's tokens -- so passages keep their
+positions and the measured prompts are byte-identical. What changes is
+what the stored KV attended to (no instructions: each passage cached in
+isolation, as in the CacheBlend paper's setting) and that the first passage
+is blended like the others; the system block's chunks drop out of
+`expected_reused_tokens`. Comparing the two settings on one dataset
+therefore isolates that effect. The setting is recorded in `plan.json` only
+when off, so earlier plans keep their fingerprints. It does not reduce
+padding in the measured prompts: with gpt-oss the template header and
+instructions fit in one 256-token chunk either way.
+
 ### Concatenated units
 
 `independent` stores each passage with no neighbours, and needs padding

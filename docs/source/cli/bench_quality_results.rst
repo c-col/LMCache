@@ -243,6 +243,10 @@ or dataset and so that later runs can check they build the same prompts.
    * - ``min_unit_tokens``
      - int
      - ``--min-unit-tokens``; ``concatenated`` only (absent otherwise).
+   * - ``store_instructions``
+     - bool
+     - ``false`` with ``--no-store-instructions``; absent otherwise (stores
+       carry the instructions, except in ``concatenated``).
 
 The arm URLs, ``--reference-repeats`` and ``--capture-blend-metrics`` are not
 settings: runs of different arms into one directory may differ in them.

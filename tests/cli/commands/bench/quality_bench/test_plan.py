@@ -87,6 +87,70 @@ class TestReorderedScenario:
         assert [p.measured_position for p in plan.samples[2].passages] == [0, 1, 2]
 
 
+class TestStoreInstructions:
+    """``store_instructions=False``: passages stored without the instructions."""
+
+    @pytest.fixture
+    def framer(self) -> ChunkAligner:
+        return _filler_aligner(Filler.DOTS)
+
+    @staticmethod
+    def _both(framer, scenario):
+        with_ = build_plan(samples(), framer, scenario, CHUNK, 11)
+        without = build_plan(
+            samples(), framer, scenario, CHUNK, 11, store_instructions=False
+        )
+        return with_, without
+
+    @pytest.mark.parametrize(
+        "scenario", [ReuseScenario.INDEPENDENT, ReuseScenario.REORDERED]
+    )
+    def test_stores_drop_the_instructions_only(self, framer, scenario) -> None:
+        with_, without = self._both(framer, scenario)
+        instructions = ANSWER_TAG_PROMPT.system.strip()
+        assert all(
+            instructions in r.messages[0]["content"] for r in with_.store_requests
+        )
+        assert all(
+            instructions not in r.messages[0]["content"] for r in without.store_requests
+        )
+        # Same passages, same store requests otherwise.
+        assert [r.request_id for r in with_.store_requests] == [
+            r.request_id for r in without.store_requests
+        ]
+
+    @pytest.mark.parametrize(
+        "scenario", [ReuseScenario.INDEPENDENT, ReuseScenario.REORDERED]
+    )
+    def test_measured_prompts_and_padding_are_unchanged(self, framer, scenario) -> None:
+        with_, without = self._both(framer, scenario)
+        assert [s.messages for s in with_.samples] == [
+            s.messages for s in without.samples
+        ]
+        assert with_.padding == without.padding
+        assert with_.prompts_digest != without.prompts_digest
+
+    def test_passages_keep_their_stored_positions(self, framer) -> None:
+        with_, without = self._both(framer, ReuseScenario.INDEPENDENT)
+        for a, b in zip(with_.store_requests, without.store_requests, strict=True):
+            block = a.messages[0]["content"].split(ANSWER_TAG_PROMPT.system, 1)[1]
+            passage = block[block.index("Passage ") :]
+            _, [placed_a] = framer.place_blocks(a.messages, [passage])
+            _, [placed_b] = framer.place_blocks(b.messages, [passage])
+            assert placed_a.problem == placed_b.problem == ""
+            assert placed_a.start_token == placed_b.start_token
+            assert placed_a.tokens == placed_b.tokens
+
+    def test_the_system_chunks_are_no_longer_expected_reuse(self, framer) -> None:
+        """Only the instructions' chunks drop out of the expectation."""
+        with_, without = self._both(framer, ReuseScenario.INDEPENDENT)
+        for a, b in zip(with_.samples, without.samples, strict=True):
+            assert a.expected_reused_tokens is not None
+            assert b.expected_reused_tokens is not None
+            lost = a.expected_reused_tokens - b.expected_reused_tokens
+            assert lost > 0 and lost % CHUNK == 0
+
+
 class TestEvidenceAndManifest:
     def test_dataset_marked_evidence_is_used(self, aligner) -> None:
         plan = _plan(aligner, ReuseScenario.REORDERED)
@@ -197,6 +261,23 @@ class TestFillers:
             ANSWER_TAG_PROMPT.question_template.format(question="Capital?")
         )
         assert "final_answer" not in prompt
+
+    @pytest.mark.parametrize("filler", list(Filler))
+    def test_every_filler_can_store_without_instructions(self, filler) -> None:
+        """The lead block aligns with each filler (the plan checks placement)."""
+        framer = _filler_aligner(filler)
+        plan = build_plan(
+            samples(),
+            framer,
+            ReuseScenario.INDEPENDENT,
+            CHUNK,
+            11,
+            store_instructions=False,
+        )
+        for request in plan.store_requests:
+            content = request.messages[0]["content"]
+            assert content.startswith(".")
+            assert ANSWER_TAG_PROMPT.system.strip() not in content
 
     def test_framed_fillers_label_each_passage(self) -> None:
         plan = _plan(_filler_aligner(Filler.DOTS), ReuseScenario.INDEPENDENT)

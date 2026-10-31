@@ -2037,6 +2037,14 @@ prompts:
        then measured over its own context -- reuse of a whole context
        computed after unrelated ones, at a new position.
 
+``independent`` and ``reordered`` store passages after the same system
+block (instructions and padding) the measured prompt opens with, so
+passages keep their positions and the first passage is an exact prefix of
+the measured prompt. ``--no-store-instructions`` stores them after padding
+that fills the same chunks instead: the measured prompts are unchanged, but
+the passages' cached KV is computed without the instructions -- each passage
+cached in isolation -- and the first passage is blended like the rest.
+
 Prompts are chunk-aligned like ``rag-qa-quality``'s, so for a caching
 candidate set ``--chunk-size`` to its chunk size. ``--filler`` picks what pads
 each passage to whole chunks. The default, ``dots``, frames it as
@@ -2317,6 +2325,11 @@ same workload flags (``--model`` through ``--seed``).
      - ``concatenated`` only: minimum tokens per stored unit. Units of about
        one context make most reuse an exact prefix; the default holds 3--6
        contexts on HotpotQA and FinanceBench.
+   * - ``--store-instructions`` / ``--no-store-instructions``
+     - on
+     - ``independent`` / ``reordered``: whether store requests carry the
+       instructions ahead of the passages (see above). Not applicable to
+       ``concatenated``, which never stores them.
    * - ``--chunk-size``
      - 256
      - LMCache chunk size. For a caching candidate, match its chunk size.

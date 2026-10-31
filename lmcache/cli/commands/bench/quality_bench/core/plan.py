@@ -501,6 +501,7 @@ def build_plan(
     seed: int,
     unit_samples: list[Sample] | None = None,
     min_unit_tokens: int = 8192,
+    store_instructions: bool = True,
 ) -> QualityPlan:
     """Build the store requests, measured prompts, and manifest for a run.
 
@@ -536,6 +537,12 @@ def build_plan(
             from, with *samples* as a prefix, so measuring fewer questions
             does not change the units. Defaults to *samples*.
         min_unit_tokens: ``concatenated`` only: the minimum unit size.
+        store_instructions: ``independent`` / ``reordered`` only: whether
+            store requests open with the system block (instructions and
+            padding). When ``False`` they open with
+            :meth:`ChunkAligner.lead_block` instead: padding only, filling
+            the same chunks, so passages keep their positions and the
+            measured prompts are unchanged.
 
     Returns:
         The plan.
@@ -559,6 +566,11 @@ def build_plan(
 
     prompt = ANSWER_TAG_PROMPT
     system_block = aligner.system_block(prompt.system)
+    # What store requests open with: the system block, or padding that
+    # occupies the same chunks without the instructions.
+    store_lead = (
+        system_block if store_instructions else aligner.lead_block(system_block)
+    )
     store_requests: list[StoreRequest] = []
     # Passage ids and blocks each request holds, in order, for the check.
     request_blocks: dict[str, tuple[list[str], list[str]]] = {}
@@ -580,7 +592,7 @@ def build_plan(
                     request_id = f"{_STORE_REQUEST_PREFIX}{len(store_requests)}"
                     store_requests.append(
                         StoreRequest(
-                            request_id, compose_store_messages(system_block, [block])
+                            request_id, compose_store_messages(store_lead, [block])
                         )
                     )
                     request_blocks[request_id] = ([passage_id], [block])
@@ -590,9 +602,7 @@ def build_plan(
             if key not in stored_lists:
                 request_id = f"{_STORE_REQUEST_PREFIX}{len(store_requests)}"
                 store_requests.append(
-                    StoreRequest(
-                        request_id, compose_store_messages(system_block, blocks)
-                    )
+                    StoreRequest(request_id, compose_store_messages(store_lead, blocks))
                 )
                 request_blocks[request_id] = (list(ids), list(blocks))
                 stored_lists[key] = request_id
